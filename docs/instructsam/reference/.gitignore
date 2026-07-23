@@ -1,0 +1,3 @@
+# .pt tensor payloads are large (~120 MB per image); regenerable from
+# tools/pathA_reference_capture.py — see README.md.
+*.pt

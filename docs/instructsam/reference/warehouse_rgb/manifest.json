@@ -1,0 +1,306 @@
+{
+  "image": "/home/thorax/Downloads/warehouse_rgb.jpg",
+  "query": "Please segment the box, the person, the shelf, and the forklift in the image.",
+  "model": "CircleRadon/InstructSAM-2B",
+  "captured_at": "2026-07-23 09:44:12",
+  "tensors": {
+    "mask_queries": {
+      "shape": [
+        10,
+        2048
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "8014b249ffdc09e2",
+      "path": "mask_queries.pt"
+    },
+    "seg_output_embeddings": {
+      "shape": [
+        4,
+        10,
+        2048
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "14aa600237a59265",
+      "path": "seg_output_embeddings.pt"
+    },
+    "pred_masks": {
+      "shape": [
+        4,
+        10,
+        288,
+        288
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "ebef4cb572e0efde",
+      "path": "pred_masks.pt"
+    },
+    "cls_score": {
+      "shape": [
+        4,
+        10
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "e848a0aa270b2b24",
+      "path": "cls_score.pt"
+    },
+    "mask_hidden_fcs_0": {
+      "shape": [
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "cecd1aad71807cc0",
+      "path": "mask_hidden_fcs_0.pt"
+    },
+    "vision_encoder_backbone::last_hidden_state": {
+      "shape": [
+        1,
+        5184,
+        1024
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "7fb4d6e0d0698c0b",
+      "path": "vision_encoder_backbone__last_hidden_state.pt"
+    },
+    "vision_encoder::last_hidden_state": {
+      "shape": [
+        1,
+        5184,
+        1024
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "7fb4d6e0d0698c0b",
+      "path": "vision_encoder__last_hidden_state.pt"
+    },
+    "text_hidden_fcs_0": {
+      "shape": [
+        4,
+        32,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "6271e0eff88a1e68",
+      "path": "text_hidden_fcs_0.pt"
+    },
+    "detr_encoder_layer_0": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "c763811e450260b7",
+      "path": "detr_encoder_layer_0.pt"
+    },
+    "detr_encoder_layer_1": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "a4a5892e8a78ae0c",
+      "path": "detr_encoder_layer_1.pt"
+    },
+    "detr_encoder_layer_2": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "30959364c1b8f9e3",
+      "path": "detr_encoder_layer_2.pt"
+    },
+    "detr_encoder_layer_3": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "70413e9653fac86a",
+      "path": "detr_encoder_layer_3.pt"
+    },
+    "detr_encoder_layer_4": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "d339e81b8f45e7b0",
+      "path": "detr_encoder_layer_4.pt"
+    },
+    "detr_encoder_layer_5": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "28ed81262bf6067c",
+      "path": "detr_encoder_layer_5.pt"
+    },
+    "detr_encoder::last_hidden_state": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "28ed81262bf6067c",
+      "path": "detr_encoder__last_hidden_state.pt"
+    },
+    "detr_encoder::pos_embeds_flattened": {
+      "shape": [
+        4,
+        5184,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "5ebd9342482d9627",
+      "path": "detr_encoder__pos_embeds_flattened.pt"
+    },
+    "detr_encoder::text_features": {
+      "shape": [
+        4,
+        32,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "6271e0eff88a1e68",
+      "path": "detr_encoder__text_features.pt"
+    },
+    "detr_encoder::spatial_shapes": {
+      "shape": [
+        1,
+        2
+      ],
+      "dtype": "torch.int64",
+      "sha256_fp16": "89b58a2ad860e291",
+      "path": "detr_encoder__spatial_shapes.pt"
+    },
+    "detr_decoder_layer_0": {
+      "shape": [
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "e0bfb1c4f14364c3",
+      "path": "detr_decoder_layer_0.pt"
+    },
+    "detr_decoder_layer_1": {
+      "shape": [
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "451301ea7d84f939",
+      "path": "detr_decoder_layer_1.pt"
+    },
+    "detr_decoder_layer_2": {
+      "shape": [
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "36c956fbdc3dde28",
+      "path": "detr_decoder_layer_2.pt"
+    },
+    "detr_decoder_layer_3": {
+      "shape": [
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "9fc02caa37a02e41",
+      "path": "detr_decoder_layer_3.pt"
+    },
+    "detr_decoder_layer_4": {
+      "shape": [
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "2b71e5e7c61a2ca5",
+      "path": "detr_decoder_layer_4.pt"
+    },
+    "detr_decoder_layer_5": {
+      "shape": [
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "ed1bb99b505e231c",
+      "path": "detr_decoder_layer_5.pt"
+    },
+    "detr_decoder::intermediate_hidden_states": {
+      "shape": [
+        6,
+        4,
+        10,
+        256
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "afdc375a68e8b7fe",
+      "path": "detr_decoder__intermediate_hidden_states.pt"
+    },
+    "detr_decoder::reference_boxes": {
+      "shape": [
+        6,
+        4,
+        10,
+        4
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "dd32bc6f5b67f9f7",
+      "path": "detr_decoder__reference_boxes.pt"
+    },
+    "dot_product_scoring": {
+      "shape": [
+        6,
+        4,
+        10,
+        1
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "70054de592cf7a8e",
+      "path": "dot_product_scoring.pt"
+    },
+    "mask_decoder::pred_masks": {
+      "shape": [
+        4,
+        10,
+        288,
+        288
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "ebef4cb572e0efde",
+      "path": "mask_decoder__pred_masks.pt"
+    },
+    "mask_decoder::semantic_seg": {
+      "shape": [
+        4,
+        1,
+        288,
+        288
+      ],
+      "dtype": "torch.bfloat16",
+      "sha256_fp16": "0ebb32d4d4a320ef",
+      "path": "mask_decoder__semantic_seg.pt"
+    }
+  },
+  "totals": {
+    "tensors_captured": 29,
+    "bytes_on_disk": 120757597,
+    "text_output_chars": 314
+  }
+}

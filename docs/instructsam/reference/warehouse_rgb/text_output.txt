@@ -1,0 +1,1 @@
+<|object_ref_start|>box<|object_ref_end|><|mask_start|>[SEG]<|mask_end|>, <|object_ref_start|>person<|object_ref_end|><|mask_start|>[SEG]<|mask_end|>, <|object_ref_start|>shelf<|object_ref_end|><|mask_start|>[SEG]<|mask_end|>, <|object_ref_start|>forklift<|object_ref_end|><|mask_start|>[SEG]<|mask_end|><|im_end|>
