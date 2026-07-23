@@ -84,6 +84,7 @@ add_library(sam3cpp
     src/instructsam_prompt_cross_attn.cpp
     src/instructsam_detr_encoder.cpp
     src/instructsam_lm_bridge.cpp
+    src/instructsam_lm_forward.cpp
     src/instructsam_vision_encoder.cpp
     src/instructsam_lm_runner.cpp
     src/encoder_fusion.cpp
@@ -125,6 +126,7 @@ add_library(sam3cpp_static STATIC
     src/instructsam_prompt_cross_attn.cpp
     src/instructsam_detr_encoder.cpp
     src/instructsam_lm_bridge.cpp
+    src/instructsam_lm_forward.cpp
     src/instructsam_vision_encoder.cpp
     src/instructsam_lm_runner.cpp
     src/encoder_fusion.cpp
@@ -222,6 +224,9 @@ target_link_libraries(sam3-instructsam-batch-e2e PRIVATE sam3cpp)
 
 add_executable(sam3-instructsam-lm-bridge-test tools/sam3_instructsam_lm_bridge_test.cpp)
 target_link_libraries(sam3-instructsam-lm-bridge-test PRIVATE sam3cpp)
+
+add_executable(sam3-instructsam-lm-forward-test tools/sam3_instructsam_lm_forward_test.cpp)
+target_link_libraries(sam3-instructsam-lm-forward-test PRIVATE sam3cpp)
 
 add_executable(sam3-instructsam-vision-encoder-test tools/sam3_instructsam_vision_encoder_test.cpp)
 target_link_libraries(sam3-instructsam-vision-encoder-test PRIVATE sam3cpp)
