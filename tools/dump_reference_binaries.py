@@ -40,6 +40,11 @@ DUMPS = [
     ("mask_decoder__instance_projection.pt",     "md_instance_embeds"),
     ("mask_decoder__pred_masks.pt",              "md_pred_masks"),
     ("mask_decoder__semantic_projection.pt",     "md_semantic_seg"),
+    # FPN inputs — captured raw. mask_decoder replaces backbone_features_2
+    # with encoder_hidden_states (post-prompt-cross-attn); we synthesize
+    # that below via a separate computation.
+    ("mask_decoder_in__backbone_features_0.pt",  "md_fpn_bb0"),
+    ("mask_decoder_in__backbone_features_1.pt",  "md_fpn_bb1"),
 ]
 
 
@@ -122,6 +127,30 @@ def main() -> int:
         print(f"  query_pos_layer_0        {list(qp.shape)} (from sinusoidal+ref_point_head)")
     else:
         print(f"  (skipping ref_point_head: {ckpt_path} not found)")
+
+    # Synthesize FPN's actual input for backbone_features_2 slot.
+    # Inside mask_decoder._embed_pixels:
+    #   encoder_visual = encoder_hidden_states[:, :spatial_dim, :]   (first 5184 tokens)
+    #   encoder_visual = encoder_visual.transpose(1,2).reshape(B, C, 72, 72)
+    #   backbone_features[-1] = encoder_visual
+    # But BEFORE _embed_pixels, if prompt_features is present:
+    #   encoder_hidden_states = raw_encoder + prompt_cross_attn(normed_encoder, prompts)
+    # We reconstruct this from what we captured.
+    enc_in_pt = REF_DIR + "/mask_decoder_in__encoder_hidden_states.pt"
+    pca_out_pt = REF_DIR + "/mask_decoder__prompt_cross_attn.pt"
+    if os.path.exists(enc_in_pt) and os.path.exists(pca_out_pt):
+        raw_enc = torch.load(enc_in_pt, map_location="cpu", weights_only=True).float()  # [4,5184,256]
+        pca_out = torch.load(pca_out_pt, map_location="cpu", weights_only=True).float()  # [4,5184,256]
+        post_enc = raw_enc + pca_out                                          # [4,5184,256]
+        obj0 = post_enc[0]                                                    # [5184,256]
+        # first 5184 tokens are the visual sub-slice (in this config all 5184 are visual)
+        visual = obj0[:5184]                                                  # [5184,256]
+        # reshape to [C, H, W] = [256, 72, 72]
+        fpn_bb2 = visual.transpose(0, 1).reshape(256, 72, 72).contiguous()
+        dump_fp32(os.path.join(OUT_DIR, "md_fpn_bb2.f32"), fpn_bb2)
+        print(f"  md_fpn_bb2 (synth)         {list(fpn_bb2.shape)}  (post-PCA encoder → reshaped)")
+    else:
+        print("  (skipping md_fpn_bb2 — encoder/pca captures not found)")
 
     print(f"\ndone. dumps at {OUT_DIR}")
     return 0

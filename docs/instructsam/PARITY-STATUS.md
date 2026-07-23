@@ -67,32 +67,64 @@ decoder inputs (backbone_features multi-scale, decoder_queries,
 encoder_hidden_states, prompt_features, prompt_mask) and intermediates
 (pixel_decoder output, mask_embedder output, instance_projection output).
 
-## What's still deferred for full E2E
+## Mask decoder — FPN (pixel_decoder)
 
-Two components stand between the current state and end-to-end masks
-without any Python intermediates:
+**InstructsamPixelDecoder now wired**
+(src/instructsam_pixel_decoder.cpp). Given 3 backbone features (coarsest
+already replaced by the caller with post-prompt-cross-attn encoder
+reshaped to [256, 72, 72]), runs 2 stages of `upscale-nearest-2x + skip +
+conv3x3 (same padding) + GroupNorm(8) + ReLU`, producing pixel_embed
+[256, 288, 288].
 
-1. **Sam3PixelDecoder FPN** (~1-2 days C++)
-   - 3 upsampling stages: conv3x3 → GroupNorm(groups=8) → ReLU
-   - Iterate coarse → fine, interpolate (nearest) + skip + conv + norm + relu
-   - InstructSAM uses 3 stages (conv_layers.0/1/2); sam3cpp's stock
-     implementation has only 2. Fork with 3 stages.
-   - Consumes `backbone_features` list [4, 256, 288, 288],
-     [4, 256, 144, 144], [4, 256, 72, 72] — replace coarsest with
-     encoder_hidden_states reshaped.
+Note: InstructSAM ships 3 pixel_decoder conv_layers/norms but with 3
+backbone-feature inputs only 2 iterations run (matches PyTorch's
+`for _, feat in enumerate(reversed(backbone_features[:-1]))` — 2 iters
+for 3 features). Layer 2 weights are dead in this config.
 
-2. **prompt_cross_attn** (~4-6 hours C++)
-   - Normalize encoder_hidden_states
-   - Cross-attention (Q=normalized encoder, K=V=prompt_features,
-     mask=bidirectional_mask from prompt_mask)
-   - Add attention output back to encoder_hidden_states (residual)
-   - Uses same Sam3Attention structure as decoder cross-attn.
+Discovery: conv2d_bias needs NO permute for PyTorch-format weights.
+Sam3cpp's stock helper permutes because their MLX-origin weights have a
+different layout. PyTorch stores Conv2d weight as [OutC, InC, KH, KW]
+which loads into GGUF/ggml as ne=[KW, KH, InC, OutC] — exactly what
+ggml_conv_2d expects.
 
-Once both land, the flow becomes:
+### Parity vs. PyTorch reference (given synthesized post-PCA encoder)
+
+FPN standalone (pixel_embed vs mask_decoder__pixel_decoder):
+- cosine (flat): **0.999997**
+- max abs diff: 0.017
+- relative L2: 0.25%
+
+Full seg-head chain (FPN → mask_tail → pred_masks vs md_pred_masks):
+- cosine (flat): **0.999998**
+- max abs diff: 0.102 (out of absmax 22 = <0.5%)
+- relative L2: 0.17%
+
+Runtime: ~11s CPU for the full FPN + mask_tail per object.
+
+## What's still deferred
+
+**prompt_cross_attn** (~4-6 hours C++) — the last remaining component
+before the segmentation half runs without any Python-computed inputs.
+
+Currently the dump script synthesizes post-prompt-cross-attn encoder as
+`raw_encoder + prompt_cross_attn_output` (reusing already-captured
+tensors), so we can validate FPN + mask_tail without wiring PCA yet.
+The math is standard:
+- LayerNorm on encoder_hidden_states
+- Cross-attention (Q=normed_encoder, K=V=prompt_features,
+  mask=bidirectional_mask from prompt_mask)
+- Residual add attention output back to raw encoder_hidden_states
+- Output feeds pixel_decoder + becomes the coarsest FPN input
+
+Uses same Sam3Attention structure as decoder cross-attn (already ported).
+
+Once PCA lands, the flow is:
 ```
-backbone_features → pixel_decoder → pixel_embed
-      + prompt_cross_attn(encoder, prompt)
-→ pixel_embed → mask_tail(pixel_embed, decoder_queries) → pred_masks
+backbone_features + encoder + prompt_features + prompt_mask
+  → prompt_cross_attn
+  → pixel_decoder (FPN)
+  → mask_tail
+  → pred_masks + semantic_seg
 ```
 
 Then wrap in a batch loop (4 objects) and the segmentation half is
