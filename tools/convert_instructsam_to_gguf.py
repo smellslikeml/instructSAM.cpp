@@ -95,6 +95,91 @@ SKIP_PREFIXES = (
 )
 
 
+# ────────────────────────────────────────────────────────────────────────
+# Dual-aliasing — InstructSAM canonical ↔ sam3cpp stock-decoder canonical
+#
+# Sam3cpp's stock Decoder::run() uses SAM3-native tensor names
+# (query_proj / ca_text / norm2 / etc.). InstructSAM's checkpoint uses
+# transformers-style names (q_proj / text_cross_attn / self_attn_layer_norm
+# / etc.). Structurally the tensors are identical.
+#
+# For sam3cpp's stock decoder to load InstructSAM tensors without a code
+# fork, each dual-named tensor must be reachable under BOTH names. We
+# implement this by emitting the tensor data twice in the GGUF (once per
+# short_name), with both short_names present in the sidecar. Runtime cost:
+# ~50-100 MB extra for decoder tensors. See docs/instructsam/DECODER-ALIASING.md.
+#
+# Non-decoder tensors (vision_encoder, mask_decoder, geometry_encoder,
+# grounding, text_projection, InstructSAM glue) use identical names in
+# both conventions and don't need aliasing.
+# ────────────────────────────────────────────────────────────────────────
+
+# Per-layer decoder tensor renames (InstructSAM sub-path → sam3cpp sub-path)
+PER_LAYER_DECODER_RENAMES = {
+    # Attention Q/K/V/O projections
+    "self_attn.q_proj":         "self_attn.query_proj",
+    "self_attn.k_proj":         "self_attn.key_proj",
+    "self_attn.v_proj":         "self_attn.value_proj",
+    "self_attn.o_proj":         "self_attn.out_proj",
+    "text_cross_attn.q_proj":   "ca_text.query_proj",
+    "text_cross_attn.k_proj":   "ca_text.key_proj",
+    "text_cross_attn.v_proj":   "ca_text.value_proj",
+    "text_cross_attn.o_proj":   "ca_text.out_proj",
+    "vision_cross_attn.q_proj": "cross_attn.query_proj",
+    "vision_cross_attn.k_proj": "cross_attn.key_proj",
+    "vision_cross_attn.v_proj": "cross_attn.value_proj",
+    "vision_cross_attn.o_proj": "cross_attn.out_proj",
+    # Layer norms (post-norm placement matches; just different names)
+    "self_attn_layer_norm":         "norm2",
+    "text_cross_attn_layer_norm":   "catext_norm",
+    "vision_cross_attn_layer_norm": "norm1",
+    "mlp_layer_norm":               "norm3",
+    # MLP linears (InstructSAM: mlp.fc1/fc2; sam3cpp: linear1/linear2)
+    "mlp.fc1": "linear1",
+    "mlp.fc2": "linear2",
+}
+
+# Non-per-layer decoder tensor renames — 1-indexed vs 0-indexed .layers.N,
+# and top-level names differ.
+GLOBAL_DECODER_RENAMES = {
+    "transformer.decoder.output_layer_norm":     "transformer.decoder.norm",
+    "transformer.decoder.box_head.layer1":       "transformer.decoder.bbox_embed.layers.0",
+    "transformer.decoder.box_head.layer2":       "transformer.decoder.bbox_embed.layers.1",
+    "transformer.decoder.box_head.layer3":       "transformer.decoder.bbox_embed.layers.2",
+    "transformer.decoder.ref_point_head.layer1": "transformer.decoder.ref_point_head.layers.0",
+    "transformer.decoder.ref_point_head.layer2": "transformer.decoder.ref_point_head.layers.1",
+    "transformer.decoder.box_rpb_embed_x.layer1": "transformer.decoder.boxRPB_embed_x.layers.0",
+    "transformer.decoder.box_rpb_embed_x.layer2": "transformer.decoder.boxRPB_embed_x.layers.1",
+    "transformer.decoder.box_rpb_embed_y.layer1": "transformer.decoder.boxRPB_embed_y.layers.0",
+    "transformer.decoder.box_rpb_embed_y.layer2": "transformer.decoder.boxRPB_embed_y.layers.1",
+}
+
+
+def sam3cpp_alias_for(instructsam_canonical: str) -> str | None:
+    """Return sam3cpp's stock canonical name for a tensor, or None if
+    the InstructSAM name is already what sam3cpp expects (no aliasing
+    needed)."""
+    # Per-layer decoder tensor: `transformer.decoder.layers.<N>.<sub>.<attr>`
+    if instructsam_canonical.startswith("transformer.decoder.layers."):
+        after = instructsam_canonical[len("transformer.decoder.layers."):]
+        try:
+            layer_idx, rest = after.split(".", 1)
+        except ValueError:
+            return None
+        for src, dst in PER_LAYER_DECODER_RENAMES.items():
+            if rest == src or rest.startswith(src + "."):
+                new_rest = dst + rest[len(src):]
+                return f"transformer.decoder.layers.{layer_idx}.{new_rest}"
+        return None
+    # Global decoder tensor
+    for src, dst in GLOBAL_DECODER_RENAMES.items():
+        if instructsam_canonical == src:
+            return dst
+        if instructsam_canonical.startswith(src + "."):
+            return dst + instructsam_canonical[len(src):]
+    return None
+
+
 def remap_name(instructsam_name: str) -> str | None:
     """Rewrite an InstructSAM tensor name to sam3cpp's expected schema.
 
@@ -294,6 +379,40 @@ def main() -> int:
 
             dtype_counts[qtype.name] += 1
             total_out_bytes += stored.nbytes
+
+            # Dual-alias emission: if this tensor has a sam3cpp-canonical
+            # equivalent (decoder-layer or decoder-global tensor with
+            # renaming), emit the tensor data a SECOND time under a fresh
+            # short_name so both names resolve at runtime. Sidecar entry
+            # for the second short → sam3cpp_canonical.
+            sam3cpp_alias = sam3cpp_alias_for(canonical_name)
+            if sam3cpp_alias is not None:
+                # Fresh short_name distinct from `sn` — hash the sam3cpp
+                # canonical string so the two shorts differ
+                alias_sn = short_name(sam3cpp_alias)
+                if alias_sn == sn:
+                    # sha1 collision on the aliased name — extremely
+                    # unlikely at 48-bit prefix but detect anyway
+                    raise RuntimeError(
+                        f"alias sha1 collision: {sn} == alias for "
+                        f"{sam3cpp_alias!r}"
+                    )
+                if alias_sn in seen_shortnames:
+                    raise RuntimeError(
+                        f"alias short_name conflict: {alias_sn} already "
+                        f"seen for {seen_shortnames[alias_sn]!r}"
+                    )
+                seen_shortnames[alias_sn] = sam3cpp_alias
+                tensor_map[alias_sn] = sam3cpp_alias
+                # Write the same tensor data under the alias short_name.
+                # sam3cpp's runtime finds it via find_tensor(sam3cpp_alias)
+                # → resolve_tensor_name → alias_sn → tensor_index_.
+                if qtype == GGMLQuantizationType.F16:
+                    writer.add_tensor(alias_sn, stored)
+                else:
+                    writer.add_tensor(alias_sn, stored, raw_dtype=qtype)
+                dtype_counts[qtype.name + "_alias"] += 1
+                total_out_bytes += stored.nbytes
 
     writer.add_uint64("sam3.tensor_count", len(tensor_map))
     print(f"  writing {len(tensor_map)} tensors to disk...")

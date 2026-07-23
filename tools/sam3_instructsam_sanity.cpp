@@ -81,6 +81,23 @@ int main(int argc, char ** argv) {
         "instructsam.mask_hidden_fcs.0.2.weight",
         "instructsam.text_hidden_fcs.0.0.weight",
         "instructsam.text_hidden_fcs.0.2.weight",
+        // Dual-alias probes — sam3cpp's stock naming; must resolve now
+        // that the converter emits aliased tensors under both names.
+        "transformer.decoder.layers.0.self_attn.query_proj.weight",
+        "transformer.decoder.layers.0.self_attn.out_proj.weight",
+        "transformer.decoder.layers.0.ca_text.query_proj.weight",
+        "transformer.decoder.layers.0.ca_text.out_proj.weight",
+        "transformer.decoder.layers.0.cross_attn.query_proj.weight",
+        "transformer.decoder.layers.0.cross_attn.out_proj.weight",
+        "transformer.decoder.layers.0.norm1.weight",
+        "transformer.decoder.layers.0.norm2.weight",
+        "transformer.decoder.layers.0.norm3.weight",
+        "transformer.decoder.layers.0.catext_norm.weight",
+        "transformer.decoder.layers.0.linear1.weight",
+        "transformer.decoder.layers.0.linear2.weight",
+        "transformer.decoder.bbox_embed.layers.0.weight",
+        "transformer.decoder.norm.weight",
+        "transformer.decoder.boxRPB_embed_x.layers.0.weight",
     };
 
     size_t found = 0;
