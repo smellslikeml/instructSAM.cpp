@@ -95,6 +95,131 @@ std::string layer_prefix(int layer) {
     return "transformer.decoder.layers." + std::to_string(layer);
 }
 
+// CPU-side helpers for per-layer refinement. Box_head + ref_point_head
+// evaluations run on 10 queries × 256 dim, so the CPU cost is tiny (fits
+// well inside the layer-graph overhead). Keeping them CPU-side avoids
+// building a second ggml graph per layer boundary.
+
+std::vector<float> cpu_linear(
+    const std::vector<float> & x,
+    int64_t in_dim,
+    int64_t out_dim,
+    int64_t batch,
+    const std::vector<float> & w,   // [out_dim, in_dim] row-major
+    const std::vector<float> & b    // [out_dim]
+) {
+    std::vector<float> out(static_cast<size_t>(batch * out_dim));
+    for (int64_t i = 0; i < batch; ++i) {
+        for (int64_t o = 0; o < out_dim; ++o) {
+            float s = b[static_cast<size_t>(o)];
+            for (int64_t k = 0; k < in_dim; ++k) {
+                s += w[static_cast<size_t>(o * in_dim + k)] *
+                     x[static_cast<size_t>(i * in_dim + k)];
+            }
+            out[static_cast<size_t>(i * out_dim + o)] = s;
+        }
+    }
+    return out;
+}
+
+void cpu_relu(std::vector<float> & v) {
+    for (float & x : v) if (x < 0.0f) x = 0.0f;
+}
+
+// Layer norm over the trailing dim (LayerNorm on [batch, dim]).
+std::vector<float> cpu_layer_norm(
+    const std::vector<float> & x,
+    int64_t batch,
+    int64_t dim,
+    const std::vector<float> & w,
+    const std::vector<float> & b
+) {
+    std::vector<float> out(x.size());
+    for (int64_t i = 0; i < batch; ++i) {
+        double mean = 0.0, var = 0.0;
+        for (int64_t d = 0; d < dim; ++d) mean += x[static_cast<size_t>(i * dim + d)];
+        mean /= dim;
+        for (int64_t d = 0; d < dim; ++d) {
+            const double diff = x[static_cast<size_t>(i * dim + d)] - mean;
+            var += diff * diff;
+        }
+        var /= dim;
+        const double inv_std = 1.0 / std::sqrt(var + kLayerNormEps);
+        for (int64_t d = 0; d < dim; ++d) {
+            const double normed = (x[static_cast<size_t>(i * dim + d)] - mean) * inv_std;
+            out[static_cast<size_t>(i * dim + d)] = static_cast<float>(
+                normed * w[static_cast<size_t>(d)] + b[static_cast<size_t>(d)]);
+        }
+    }
+    return out;
+}
+
+float cpu_sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
+// Matches sam3cpp's inverse_sigmoid_vec logic (clip then log(x/(1-x))).
+constexpr float kInvSigmoidEps = 1e-3f;
+float cpu_inverse_sigmoid(float x) {
+    const float c = std::min(1.0f - kInvSigmoidEps, std::max(kInvSigmoidEps, x));
+    return std::log(c / (1.0f - c));
+}
+
+// Compute per-layer query_pos from reference_boxes [num_queries, 4].
+// Mirrors dump_reference_binaries.py's implementation: sinusoidal
+// encoding (128 features per coord, order y,x,w,h concat) then
+// ref_point_head 2-layer MLP (512 → 256 → 256, ReLU between).
+std::vector<float> cpu_compute_query_pos(
+    const std::vector<float> & ref_boxes,   // [num_queries, 4] sigmoid space
+    int64_t num_queries,
+    const std::vector<float> & rph1_w,      // [256, 512]
+    const std::vector<float> & rph1_b,      // [256]
+    const std::vector<float> & rph2_w,      // [256, 256]
+    const std::vector<float> & rph2_b       // [256]
+) {
+    const int64_t half = kModelDim / 2;   // 128
+    const float scale = 2.0f * static_cast<float>(M_PI);
+
+    std::vector<float> dim_t(static_cast<size_t>(half));
+    for (int64_t i = 0; i < half; ++i) {
+        const float exponent = 2.0f * std::floor(static_cast<float>(i) / 2.0f) /
+                               static_cast<float>(half);
+        dim_t[static_cast<size_t>(i)] = std::pow(10000.0f, exponent);
+    }
+
+    // Compute sinusoidal features per coord: [num_queries, 4, 128]
+    // Concat order y, x, w, h (per InstructSAM's encode_boxes).
+    std::vector<float> query_sine(static_cast<size_t>(num_queries * 4 * half));
+    const int coord_order[4] = {1, 0, 2, 3};  // y first, then x, w, h
+    for (int64_t q = 0; q < num_queries; ++q) {
+        for (int slot = 0; slot < 4; ++slot) {
+            const int coord = coord_order[slot];
+            const float p = ref_boxes[static_cast<size_t>(q * 4 + coord)] * scale;
+            for (int64_t i = 0; i < half; ++i) {
+                const float v = p / dim_t[static_cast<size_t>(i)];
+                const float trig = (i % 2 == 0) ? std::sin(v) : std::cos(v);
+                query_sine[static_cast<size_t>(q * 4 * half + slot * half + i)] = trig;
+            }
+        }
+    }
+
+    // ref_point_head: linear1 → ReLU → linear2
+    auto h1 = cpu_linear(query_sine, 4 * half, kModelDim, num_queries, rph1_w, rph1_b);
+    cpu_relu(h1);
+    return cpu_linear(h1, kModelDim, kModelDim, num_queries, rph2_w, rph2_b);
+}
+
+// Update reference_boxes: sigmoid(inverse_sigmoid(prev) + delta)
+std::vector<float> cpu_update_reference_boxes(
+    const std::vector<float> & prev_boxes,   // [num_queries, 4]
+    const std::vector<float> & delta_boxes,  // [num_queries, 4]
+    int64_t num_queries
+) {
+    std::vector<float> out(static_cast<size_t>(num_queries * 4));
+    for (size_t i = 0; i < prev_boxes.size(); ++i) {
+        out[i] = cpu_sigmoid(cpu_inverse_sigmoid(prev_boxes[i]) + delta_boxes[i]);
+    }
+    return out;
+}
+
 // InstructSAM box relative position bias — mathematically identical to
 // sam3cpp's build_box_rpb_bias, but with the presence-token slot removed
 // (output shape is [heads, num_queries, hw] instead of [heads, num_queries+1, hw]).
@@ -459,51 +584,95 @@ DecoderOutput InstructsamDecoder::run(
 
     // Working buffer for the queries — updated layer-by-layer
     std::vector<float> current_hidden = queries;
-    // Query positional embedding — if caller supplied one, use it (real layer-0
-    // pos from ref_point_head(sinusoidal(reference_points))). Otherwise zeros
-    // (structural smoke only, not numerically meaningful).
-    std::vector<float> query_pos_buf;
-    if (query_pos_ext.empty()) {
-        query_pos_buf.assign(static_cast<size_t>(kNumQueries * kModelDim), 0.0f);
-    } else {
+
+    // Load per-layer refinement weights ONCE before the layer loop. These
+    // drive the CPU-side computation between layers that produces the
+    // next layer's query_pos and vision box_rpb bias.
+    //
+    // The GGUF stores large weight matrices as F16 (to save space) and
+    // small tensors (biases, norms) as F32. This accessor handles both
+    // by reading the raw bytes and converting to F32 in-CPU.
+    const std::string dp = "transformer.decoder";
+    auto get_f32 = [&](const std::string & name, size_t n) {
+        ggml_tensor * t = require_tensor(model_, name);
+        std::vector<float> v(n);
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        } else if (t->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(ggml_fp16_t));
+            for (size_t i = 0; i < n; ++i) v[i] = ggml_fp16_to_fp32(buf[i]);
+        } else {
+            throw std::runtime_error("get_f32: unsupported dtype for " + name);
+        }
+        return v;
+    };
+    // Refinement enabled only when caller supplied initial_reference_boxes.
+    // Without it, query_pos falls back to caller's ext (or zeros) and
+    // vision_bias stays empty — structural smoke only.
+    const bool refine = !initial_reference_boxes.empty();
+    if (refine && initial_reference_boxes.size() != static_cast<size_t>(kNumQueries * 4)) {
+        throw std::runtime_error("InstructsamDecoder.run: initial_reference_boxes must be [10, 4]");
+    }
+
+    std::vector<float> bh1w, bh1b, bh2w, bh2b, bh3w, bh3b;
+    std::vector<float> rph1w, rph1b, rph2w, rph2b;
+    std::vector<float> oln_w, oln_b;
+    std::vector<float> rpx0w, rpx0b, rpx1w, rpx1b, rpy0w, rpy0b, rpy1w, rpy1b;
+    if (refine) {
+        bh1w = get_f32(dp + ".box_head.layer1.weight", kModelDim * kModelDim);
+        bh1b = get_f32(dp + ".box_head.layer1.bias",   kModelDim);
+        bh2w = get_f32(dp + ".box_head.layer2.weight", kModelDim * kModelDim);
+        bh2b = get_f32(dp + ".box_head.layer2.bias",   kModelDim);
+        bh3w = get_f32(dp + ".box_head.layer3.weight", 4 * kModelDim);
+        bh3b = get_f32(dp + ".box_head.layer3.bias",   4);
+
+        rph1w = get_f32(dp + ".ref_point_head.layer1.weight", kModelDim * (2 * kModelDim));
+        rph1b = get_f32(dp + ".ref_point_head.layer1.bias",   kModelDim);
+        rph2w = get_f32(dp + ".ref_point_head.layer2.weight", kModelDim * kModelDim);
+        rph2b = get_f32(dp + ".ref_point_head.layer2.bias",   kModelDim);
+
+        oln_w = get_f32(dp + ".output_layer_norm.weight", kModelDim);
+        oln_b = get_f32(dp + ".output_layer_norm.bias",   kModelDim);
+
+        rpx0w = get_f32(dp + ".box_rpb_embed_x.layer1.weight", kModelDim * 2);
+        rpx0b = get_f32(dp + ".box_rpb_embed_x.layer1.bias",   kModelDim);
+        rpx1w = get_f32(dp + ".box_rpb_embed_x.layer2.weight", kHeads * kModelDim);
+        rpx1b = get_f32(dp + ".box_rpb_embed_x.layer2.bias",   kHeads);
+        rpy0w = get_f32(dp + ".box_rpb_embed_y.layer1.weight", kModelDim * 2);
+        rpy0b = get_f32(dp + ".box_rpb_embed_y.layer1.bias",   kModelDim);
+        rpy1w = get_f32(dp + ".box_rpb_embed_y.layer2.weight", kHeads * kModelDim);
+        rpy1b = get_f32(dp + ".box_rpb_embed_y.layer2.bias",   kHeads);
+    }
+
+    // Query positional embedding buffer, updated each layer from
+    // current_ref_boxes when refinement is enabled. If caller passed
+    // query_pos_ext, use it for layer 0 (must match what ref_point_head
+    // would produce from initial_reference_points); refinement then
+    // overwrites for layers 1-5. If refinement is off and no ext, zeros.
+    std::vector<float> query_pos_buf(static_cast<size_t>(kNumQueries * kModelDim), 0.0f);
+    if (!query_pos_ext.empty()) {
         if (query_pos_ext.size() != static_cast<size_t>(kNumQueries * kModelDim)) {
             throw std::runtime_error("InstructsamDecoder.run: query_pos must be [10, 256]");
         }
         query_pos_buf = query_pos_ext;
     }
 
-    // Compute the vision cross-attention box_rpb bias. If caller supplied
-    // initial_reference_boxes, use them for all 6 layers (approximation until
-    // per-layer box_head refinement wiring lands); otherwise no bias.
-    //
-    // Feature grid is fixed at 72×72 (kResolution=1024 / kStride=... = 72 for
-    // InstructSAM's vision backbone) so we can hardcode.
+    // Feature grid is 72×72 for InstructSAM (matches 5184 vision tokens).
     constexpr int32_t kFeatH = 72;
     constexpr int32_t kFeatW = 72;
+
+    // Current reference boxes — updated per layer via box_head + inverse_sigmoid.
+    std::vector<float> current_ref_boxes = initial_reference_boxes;
+
+    // Compute layer-0 box_rpb bias if refinement enabled. When disabled,
+    // vision_bias stays empty and the vision cross-attn runs without RPB.
     std::vector<float> vision_bias;
-    if (!initial_reference_boxes.empty()) {
-        if (initial_reference_boxes.size() != static_cast<size_t>(kNumQueries * 4)) {
-            throw std::runtime_error("InstructsamDecoder.run: initial_reference_boxes must be [10, 4]");
-        }
-        const std::string p = "transformer.decoder";
-        auto get_f32 = [&](const std::string & name, size_t n) {
-            std::vector<float> v(n);
-            ggml_backend_tensor_get(require_tensor(model_, name), v.data(), 0, v.size() * sizeof(float));
-            return v;
-        };
-        const auto x0w = get_f32(p + ".box_rpb_embed_x.layer1.weight", kModelDim * 2);
-        const auto x0b = get_f32(p + ".box_rpb_embed_x.layer1.bias", kModelDim);
-        const auto x1w = get_f32(p + ".box_rpb_embed_x.layer2.weight", kHeads * kModelDim);
-        const auto x1b = get_f32(p + ".box_rpb_embed_x.layer2.bias", kHeads);
-        const auto y0w = get_f32(p + ".box_rpb_embed_y.layer1.weight", kModelDim * 2);
-        const auto y0b = get_f32(p + ".box_rpb_embed_y.layer1.bias", kModelDim);
-        const auto y1w = get_f32(p + ".box_rpb_embed_y.layer2.weight", kHeads * kModelDim);
-        const auto y1b = get_f32(p + ".box_rpb_embed_y.layer2.bias", kHeads);
+    if (refine) {
         vision_bias = build_instructsam_box_rpb_bias(
-            initial_reference_boxes,
-            kNumQueries, kFeatH, kFeatW,
-            x0w, x0b, x1w, x1b,
-            y0w, y0b, y1w, y1b);
+            current_ref_boxes, kNumQueries, kFeatH, kFeatW,
+            rpx0w, rpx0b, rpx1w, rpx1b,
+            rpy0w, rpy0b, rpy1w, rpy1b);
     }
 
     DecoderOutput out;
@@ -594,11 +763,32 @@ DecoderOutput InstructsamDecoder::run(
             out.hs[static_cast<size_t>(layer)].size() * sizeof(float));
         current_hidden = out.hs[static_cast<size_t>(layer)];
 
-        // Placeholder for reference_boxes + presence_logits — not yet
-        // wired up. Step 2e will implement box refinement via bbox_embed
-        // + reference_points update between layers.
-        out.reference_boxes[static_cast<size_t>(layer)].assign(
-            static_cast<size_t>(kNumQueries * 4), 0.0f);
+        // Per-layer box refinement (CPU): output_layer_norm → box_head →
+        // sigmoid(inverse_sigmoid(prev) + delta). Then rebuild query_pos
+        // and box_rpb bias from the updated reference_boxes for the next
+        // layer's forward pass.
+        if (refine) {
+            const auto normed = cpu_layer_norm(current_hidden, kNumQueries, kModelDim, oln_w, oln_b);
+            auto h = cpu_linear(normed, kModelDim, kModelDim, kNumQueries, bh1w, bh1b);
+            cpu_relu(h);
+            auto h2 = cpu_linear(h, kModelDim, kModelDim, kNumQueries, bh2w, bh2b);
+            cpu_relu(h2);
+            const auto delta = cpu_linear(h2, kModelDim, 4, kNumQueries, bh3w, bh3b);
+            current_ref_boxes = cpu_update_reference_boxes(current_ref_boxes, delta, kNumQueries);
+            out.reference_boxes[static_cast<size_t>(layer)] = current_ref_boxes;
+
+            if (layer + 1 < kLayers) {
+                query_pos_buf = cpu_compute_query_pos(
+                    current_ref_boxes, kNumQueries, rph1w, rph1b, rph2w, rph2b);
+                vision_bias = build_instructsam_box_rpb_bias(
+                    current_ref_boxes, kNumQueries, kFeatH, kFeatW,
+                    rpx0w, rpx0b, rpx1w, rpx1b,
+                    rpy0w, rpy0b, rpy1w, rpy1b);
+            }
+        } else {
+            out.reference_boxes[static_cast<size_t>(layer)].assign(
+                static_cast<size_t>(kNumQueries * 4), 0.0f);
+        }
         out.presence_logits[static_cast<size_t>(layer)].assign(1, 0.0f);
 
         ggml_backend_sched_free(sched);

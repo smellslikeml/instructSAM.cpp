@@ -28,6 +28,9 @@ DUMPS = [
     ("detr_encoder__pos_embeds_flattened.pt",    "vision_pos"),
     ("detr_decoder_layer_0.pt",                  "expected_layer_0"),
     ("detr_decoder_layer_1.pt",                  "expected_layer_1"),
+    ("detr_decoder_layer_2.pt",                  "expected_layer_2"),
+    ("detr_decoder_layer_3.pt",                  "expected_layer_3"),
+    ("detr_decoder_layer_4.pt",                  "expected_layer_4"),
     ("detr_decoder_layer_5.pt",                  "expected_layer_5"),
     ("detr_decoder__reference_boxes.pt",         "reference_boxes_all"),
 ]

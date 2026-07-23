@@ -210,34 +210,38 @@ int main(int argc, char ** argv) {
                           << " absmax=" << absmax << "\n";
             }
 
-            // Reference comparison — layer 0 only for now. Other layers
-            // require box refinement between layers (deferred to step 2e
-            // continuation).
-            const auto & hs0 = out.hs[0];
-            double sum = 0.0, sumsq = 0.0, absmax = 0.0;
-            for (float x : expected0) {
-                sum += x; sumsq += static_cast<double>(x) * x;
-                if (std::fabs(x) > absmax) absmax = std::fabs(x);
+            // Per-layer reference comparison.
+            std::cout << "\n  per-layer parity (ours vs. reference):\n";
+            std::cout << "    layer | cos_sim | max_diff | rel_L2\n";
+            std::cout << "    ------+---------+----------+--------\n";
+            int layers_above_099 = 0;
+            for (int l = 0; l < out.num_layers; ++l) {
+                std::vector<int64_t> es;
+                std::vector<float> expected;
+                try {
+                    expected = read_bin_f32(
+                        parity_dir + "/expected_layer_" + std::to_string(l) + ".f32", es);
+                } catch (...) {
+                    std::cout << "    " << l << "     | (no reference)\n";
+                    continue;
+                }
+                const auto & hs = out.hs[static_cast<size_t>(l)];
+                const double cos_sim = mean_cosine(hs, expected, nq, dim);
+                double maxdiff = 0.0, l2diff = 0.0, l2ref = 0.0;
+                for (size_t i = 0; i < hs.size(); ++i) {
+                    const double d = static_cast<double>(hs[i]) - expected[i];
+                    if (std::fabs(d) > maxdiff) maxdiff = std::fabs(d);
+                    l2diff += d * d;
+                    l2ref  += static_cast<double>(expected[i]) * expected[i];
+                }
+                const double rel_l2 = std::sqrt(l2diff) / std::sqrt(l2ref);
+                if (cos_sim > 0.99) ++layers_above_099;
+                std::cout << "    L" << l
+                          << "    | " << cos_sim
+                          << " | " << maxdiff
+                          << " | " << rel_l2 << "\n";
             }
-            const double emean = sum / expected0.size();
-            const double evar  = sumsq / expected0.size() - emean * emean;
-            std::cout << "  L0 ref:  mean=" << emean
-                      << " std=" << std::sqrt(std::max(0.0, evar))
-                      << " absmax=" << absmax << "\n";
-
-            const double cos_sim = mean_cosine(hs0, expected0, nq, dim);
-            double maxdiff = 0.0, l2diff = 0.0, l2ref = 0.0;
-            for (size_t i = 0; i < hs0.size(); ++i) {
-                const double d = static_cast<double>(hs0[i]) - expected0[i];
-                if (std::fabs(d) > maxdiff) maxdiff = std::fabs(d);
-                l2diff += d * d;
-                l2ref  += static_cast<double>(expected0[i]) * expected0[i];
-            }
-            const double rel_l2 = std::sqrt(l2diff) / std::sqrt(l2ref);
-            std::cout << "\n  layer-0 parity (ours vs. reference):\n";
-            std::cout << "    mean cosine similarity  : " << cos_sim << "\n";
-            std::cout << "    max absolute diff       : " << maxdiff << "\n";
-            std::cout << "    relative L2 error       : " << rel_l2 << "\n";
+            std::cout << "\n  " << layers_above_099 << "/6 layers achieve cos_sim > 0.99\n";
         } catch (const std::exception & e) {
             std::cerr << "  ✗ parity threw: " << e.what() << "\n";
             return 6;
