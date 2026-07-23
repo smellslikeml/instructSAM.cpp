@@ -139,31 +139,65 @@ Runtime: ~10.7s CPU per object for the full seg-head chain.
 Python-computed inputs**, given raw mask_decoder inputs. Only LM half
 remains (already available via Path B's llama.cpp Qwen3-VL support).
 
+## DETR encoder (vision-text fusion)
+
+**InstructsamDetrEncoder now wired**
+(src/instructsam_detr_encoder.cpp). Six pre-norm layers of
+self_attn + cross_attn + mlp, fusing vision features with text.
+
+Per-layer flow (PRE-NORM — opposite of decoder!):
+```
+normed = layer_norm1(hidden)
+qk     = normed + vision_pos
+self_out = self_attn(Q=qk, K=qk, V=normed)
+hidden = hidden + self_out
+normed = layer_norm2(hidden)
+cross_out = cross_attn(Q=normed, K=V=text_features, mask=text_mask)
+hidden = hidden + cross_out
+normed = layer_norm3(hidden)
+hidden = hidden + mlp(normed)
+```
+
+Per-layer parity vs. detr_encoder_layer_N.pt (warehouse_rgb obj 0):
+
+| Layer | Cos-sim | Max diff | Rel L2 |
+|---|---|---|---|
+| L0 | 0.999995 | 0.033 | 0.31% |
+| L1 | 0.999991 | 0.060 | 0.43% |
+| L2 | 0.999987 | 0.089 | 0.51% |
+| L3 | 0.999987 | 0.126 | 0.52% |
+| L4 | 0.999986 | 0.158 | 0.51% |
+| L5 | 0.999984 | 0.192 | 0.53% |
+
+All 6 layers > 0.9999 cos-sim on first compile — no debugging needed.
+The pre-norm structure + tensor naming were correct from source
+inspection. Small drift across layers is expected fp16/bf16 divergence.
+
+Runtime: ~7.75s CPU for the full 6-layer encoder.
+
 ## What's still needed for full pixel_values → masks
 
-The seg-head chain takes `encoder_hidden_states`, `prompt_features`,
-`prompt_mask`, `backbone_features`, and `decoder_queries` as inputs.
-Everything downstream of those is now ggml-native. What produces those:
+The encoder + seg-head + decoder chain now takes `vision_features`
+(flattened 72×72 backbone output), `text_features`, `vision_pos`,
+`text_mask`, `prompt_features`, `prompt_mask`, and `backbone_features`
+list as inputs. Everything downstream is ggml-native.
 
-- **encoder_hidden_states** — output of detr_encoder (fusion between
-  vision backbone features and text_features). Six DETR encoder layers,
-  same Sam3Attention structure as the decoder we already ported. Would
-  be a smaller-effort fork of the same pattern (~1 day estimate).
-- **decoder_queries** — output of detr_decoder (already ggml-native as
-  of step 2e — the InstructsamDecoder we built earlier).
-- **prompt_features, prompt_mask** — text encoder output (CLIP text
-  model) + tokenization. Text encoder wiring is straightforward but
-  needs GGUF conversion of the CLIP text weights too.
-- **backbone_features** — vision encoder (Sam3ViT + FPN neck) forward.
-  Substantial component but with lots of prior art in sam3cpp and
-  llama.cpp's mtmd path (Path B's `qwen3vl.cpp`).
+What still produces those upstream:
 
-Batch loop over 4 objects is trivial (~30 min) once the above land.
-The CLI orchestrator would combine llama.cpp (LM + mask_hidden_fcs) +
-our detr_encoder + detr_decoder + PCA/FPN/mask_tail for full inference.
+- **Vision encoder (Sam3ViT + FPN neck)** — forward pass on pixel_values
+  produces `fpn_hidden_states` list (backbone features at multiple
+  scales). Substantial ViT graph but with lots of prior art in sam3cpp
+  (its vision_trunk.cpp) and llama.cpp's mtmd path.
+- **Text encoder (CLIP text)** — tokenization + text encoder forward
+  produces `text_features` (post-text_projection) and `text_mask`.
+  Straightforward but needs GGUF conversion of the CLIP text weights.
+- **Position encoding** — `fpn_position_encoding` produced alongside FPN.
+  Sinusoidal 2D position embeddings; small compute.
 
-At that point: `image.jpg + query text → pred_masks.pt` end-to-end in
-native ggml. That's the Path A goal.
+Batch loop over 4 objects: trivial (~30 min). CLI orchestrator:
+combines llama.cpp (LM half + mask_hidden_fcs projection) with our
+detr_encoder + detr_decoder + PCA/FPN/mask_tail. That gets us to
+`image.jpg + query text → pred_masks.pt` in native ggml.
 
 ## Iteration ledger — full path A journey so far
 

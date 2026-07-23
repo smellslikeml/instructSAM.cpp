@@ -51,6 +51,15 @@ DUMPS = [
     ("mask_decoder_in__prompt_mask.pt",           "md_pca_prompt_mask"),
     ("mask_decoder__prompt_cross_attn_norm.pt",   "md_pca_normed"),
     ("mask_decoder__prompt_cross_attn.pt",        "md_pca_attn_out"),
+    # DETR encoder inputs + per-layer references
+    ("detr_encoder__text_features.pt",            "enc_text_features"),
+    ("detr_encoder__pos_embeds_flattened.pt",     "enc_vision_pos_flat"),
+    ("detr_encoder_layer_0.pt",                   "enc_expected_layer_0"),
+    ("detr_encoder_layer_1.pt",                   "enc_expected_layer_1"),
+    ("detr_encoder_layer_2.pt",                   "enc_expected_layer_2"),
+    ("detr_encoder_layer_3.pt",                   "enc_expected_layer_3"),
+    ("detr_encoder_layer_4.pt",                   "enc_expected_layer_4"),
+    ("detr_encoder_layer_5.pt",                   "enc_expected_layer_5"),
 ]
 
 
@@ -157,6 +166,19 @@ def main() -> int:
         print(f"  md_fpn_bb2 (synth)         {list(fpn_bb2.shape)}  (post-PCA encoder → reshaped)")
     else:
         print("  (skipping md_fpn_bb2 — encoder/pca captures not found)")
+
+    # DETR encoder vision_features input — flatten mask_decoder_in's
+    # backbone_features_2 [B, 256, 72, 72] to [B, 5184, 256]. This is the
+    # exact same tensor detr_encoder receives (fpn_hidden_states[-1] pre-flatten).
+    bb2_in_pt = REF_DIR + "/mask_decoder_in__backbone_features_2.pt"
+    if os.path.exists(bb2_in_pt):
+        bb2 = torch.load(bb2_in_pt, map_location="cpu", weights_only=True).float()  # [4,256,72,72]
+        obj0 = bb2[0]  # [256, 72, 72]
+        # DETR encoder flattens: features.flatten(2).transpose(1, 2)
+        #   [C, H, W] → [C, H*W] → [H*W, C]
+        vision_flat = obj0.flatten(1).transpose(0, 1).contiguous()   # [5184, 256]
+        dump_fp32(os.path.join(OUT_DIR, "enc_vision_features_flat.f32"), vision_flat)
+        print(f"  enc_vision_features_flat (synth)  {list(vision_flat.shape)}  (bb2 → flatten+transpose)")
 
     print(f"\ndone. dumps at {OUT_DIR}")
     return 0
