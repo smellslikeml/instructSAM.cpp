@@ -43,6 +43,7 @@ def main():
         ("vision_backbone__patch_embed.pt",     "patch_embed"),
         ("vision_backbone__embeddings.pt",      "embeddings"),
         ("vision_backbone__pre_layer_norm.pt",  "pre_layer_norm"),
+        ("vision_encoder_backbone__last_hidden_state.pt", "trunk_out"),
     ]:
         p = os.path.join(REF_DIR, pt_name)
         if not os.path.exists(p):

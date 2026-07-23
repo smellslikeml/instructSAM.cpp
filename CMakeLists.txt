@@ -224,6 +224,9 @@ target_link_libraries(sam3-instructsam-lm-bridge-test PRIVATE sam3cpp)
 add_executable(sam3-instructsam-vision-encoder-test tools/sam3_instructsam_vision_encoder_test.cpp)
 target_link_libraries(sam3-instructsam-vision-encoder-test PRIVATE sam3cpp)
 
+add_executable(sam3-instructsam-vision-neck-test tools/sam3_instructsam_vision_neck_test.cpp)
+target_link_libraries(sam3-instructsam-vision-neck-test PRIVATE sam3cpp)
+
 add_executable(sam3-text-encode tools/sam3_text_encode.cpp)
 target_link_libraries(sam3-text-encode PRIVATE sam3cpp)
 

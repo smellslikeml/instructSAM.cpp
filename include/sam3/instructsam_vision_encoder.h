@@ -78,6 +78,21 @@ public:
         const std::vector<int64_t> & pixel_shape
     ) const;
 
+    // FPN neck: given trunk output [72*72, 1024] (hidden fastest,
+    // (h, w, c) memory order), produces the 3 FPN levels the DETR encoder +
+    // mask decoder consume (drops the smallest 36×36 level).
+    //
+    // Returns 3 tensors, each [C=256, H, W] in (c, h, w) memory order with
+    // w fastest — matches PyTorch's [B, C, H, W] backbone_features format.
+    //
+    // Levels: [256, 288, 288], [256, 144, 144], [256, 72, 72].
+    struct FpnOutputs {
+        std::vector<float> bb0;   // [256, 288, 288]   scale=4× (up)
+        std::vector<float> bb1;   // [256, 144, 144]   scale=2× (up)
+        std::vector<float> bb2;   // [256, 72, 72]     scale=1× (identity)
+    };
+    FpnOutputs run_neck(const std::vector<float> & trunk_output) const;
+
 private:
     const GgufModel & model_;
 };

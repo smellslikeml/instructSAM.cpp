@@ -270,6 +270,105 @@ std::vector<float> cpu_window_unpartition(
     return out;
 }
 
+// ── CPU conv2d 1x1: y[oc, h, w] = sum_ic w[oc, ic] * x[ic, h, w] + b[oc] ──
+std::vector<float> cpu_conv2d_1x1(
+    const std::vector<float> & x, int64_t Cin, int64_t H, int64_t W, int64_t Cout,
+    const std::vector<float> & w,   // [Cout, Cin, 1, 1] → flat [Cout, Cin]
+    const std::vector<float> & b    // [Cout]
+) {
+    std::vector<float> y(static_cast<size_t>(Cout * H * W));
+    const int64_t HW = H * W;
+    for (int64_t oc = 0; oc < Cout; ++oc) {
+        const float bo = b[static_cast<size_t>(oc)];
+        for (int64_t p = 0; p < HW; ++p) {
+            float s = bo;
+            for (int64_t ic = 0; ic < Cin; ++ic) {
+                s += w[static_cast<size_t>(oc * Cin + ic)] *
+                     x[static_cast<size_t>(ic * HW + p)];
+            }
+            y[static_cast<size_t>(oc * HW + p)] = s;
+        }
+    }
+    return y;
+}
+
+// ── CPU conv2d 3x3 same-padding (zero-fill) ─────────────────────────────
+std::vector<float> cpu_conv2d_3x3(
+    const std::vector<float> & x, int64_t Cin, int64_t H, int64_t W, int64_t Cout,
+    const std::vector<float> & w,   // [Cout, Cin, 3, 3]
+    const std::vector<float> & b    // [Cout]
+) {
+    std::vector<float> y(static_cast<size_t>(Cout * H * W), 0.0f);
+    const int64_t K = 3, PAD = 1;
+    for (int64_t oc = 0; oc < Cout; ++oc) {
+        const float bo = b[static_cast<size_t>(oc)];
+        for (int64_t h = 0; h < H; ++h) {
+            for (int64_t iw = 0; iw < W; ++iw) {
+                float s = bo;
+                for (int64_t ic = 0; ic < Cin; ++ic) {
+                    for (int64_t kh = 0; kh < K; ++kh) {
+                        const int64_t src_h = h + kh - PAD;
+                        if (src_h < 0 || src_h >= H) continue;
+                        for (int64_t kw = 0; kw < K; ++kw) {
+                            const int64_t src_w = iw + kw - PAD;
+                            if (src_w < 0 || src_w >= W) continue;
+                            const float xv = x[static_cast<size_t>(
+                                ic * (H * W) + src_h * W + src_w)];
+                            const float wv = w[static_cast<size_t>(
+                                oc * (Cin * K * K) + ic * (K * K) + kh * K + kw)];
+                            s += wv * xv;
+                        }
+                    }
+                }
+                y[static_cast<size_t>(oc * (H * W) + h * W + iw)] = s;
+            }
+        }
+    }
+    return y;
+}
+
+// ── CPU ConvTranspose2d kernel=2, stride=2 (2x upsample, no overlap) ─────
+// PyTorch ConvTranspose2d weight shape: [in_channels, out_channels, kH, kW]
+// For k=2, s=2: output at (out_h, out_w) receives contribution from ONE
+// input position (in_h = out_h / 2, in_w = out_w / 2), using kernel
+// coordinates (out_h % 2, out_w % 2).
+//   y[oc, out_h, out_w] = sum_ic w[ic, oc, out_h%2, out_w%2] * x[ic, in_h, in_w] + b[oc]
+std::vector<float> cpu_conv_transpose2d_k2s2(
+    const std::vector<float> & x, int64_t Cin, int64_t H, int64_t W, int64_t Cout,
+    const std::vector<float> & w,   // [Cin, Cout, 2, 2]
+    const std::vector<float> & b    // [Cout]
+) {
+    const int64_t OH = H * 2, OW = W * 2;
+    std::vector<float> y(static_cast<size_t>(Cout * OH * OW));
+    for (int64_t oc = 0; oc < Cout; ++oc) {
+        const float bo = b[static_cast<size_t>(oc)];
+        for (int64_t out_h = 0; out_h < OH; ++out_h) {
+            const int64_t in_h = out_h / 2;
+            const int64_t kh   = out_h % 2;
+            for (int64_t out_w = 0; out_w < OW; ++out_w) {
+                const int64_t in_w = out_w / 2;
+                const int64_t kw   = out_w % 2;
+                float s = bo;
+                for (int64_t ic = 0; ic < Cin; ++ic) {
+                    // weight indexed [ic, oc, kh, kw]
+                    const float wv = w[static_cast<size_t>(
+                        ic * (Cout * 4) + oc * 4 + kh * 2 + kw)];
+                    const float xv = x[static_cast<size_t>(
+                        ic * (H * W) + in_h * W + in_w)];
+                    s += wv * xv;
+                }
+                y[static_cast<size_t>(oc * (OH * OW) + out_h * OW + out_w)] = s;
+            }
+        }
+    }
+    return y;
+}
+
+// ── CPU GELU (exact erf-based) ──────────────────────────────────────────
+void cpu_gelu(std::vector<float> & x) {
+    for (float & v : x) v = 0.5f * v * (1.0f + std::erf(v / std::sqrt(2.0f)));
+}
+
 std::vector<std::string> trunk_top_tensor_names() {
     return {
         kBase + ".embeddings.patch_embeddings.projection.weight",
@@ -660,6 +759,95 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
 
     for (size_t i = 0; i < mlp_out.size(); ++i) mlp_out[i] += residual2[i];
     return mlp_out;
+}
+
+InstructsamVisionEncoder::FpnOutputs InstructsamVisionEncoder::run_neck(
+    const std::vector<float> & trunk_output
+) const {
+    if (trunk_output.size() != static_cast<size_t>(kNumPatches * kHiddenSize)) {
+        throw std::runtime_error("run_neck: trunk_output must be [72*72, 1024]");
+    }
+
+    // Trunk output is [seq=5184, hidden=1024] with hidden fastest, i.e.
+    // memory order (h, w, c) with c inner. FPN expects [C, H, W] with
+    // w fastest. Reshape: for each (c, h, w), target[c*72*72 + h*72 + w]
+    // = trunk_output[(h*72 + w) * 1024 + c].
+    std::vector<float> hs(static_cast<size_t>(kHiddenSize * kGridSize * kGridSize));
+    for (int64_t h = 0; h < kGridSize; ++h) {
+        for (int64_t w = 0; w < kGridSize; ++w) {
+            for (int64_t c = 0; c < kHiddenSize; ++c) {
+                hs[static_cast<size_t>(c * kGridSize * kGridSize + h * kGridSize + w)] =
+                    trunk_output[static_cast<size_t>((h * kGridSize + w) * kHiddenSize + c)];
+            }
+        }
+    }
+
+    const std::string base = "backbone.vision_backbone.convs.fpn_layers";
+    auto get_f32 = [&](const std::string & name, size_t n) {
+        ggml_tensor * t = require_tensor(model_, name);
+        std::vector<float> v(n);
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        } else if (t->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(ggml_fp16_t));
+            for (size_t i = 0; i < n; ++i) v[i] = ggml_fp16_to_fp32(buf[i]);
+        } else throw std::runtime_error("run_neck: unsupported dtype");
+        return v;
+    };
+
+    FpnOutputs out;
+
+    // ── FPN layer 0 (scale=4×): ConvT(1024→512) → GELU → ConvT(512→256)
+    //                            → proj1 Conv1x1(256→256) → proj2 Conv3x3(256→256) ─
+    {
+        const std::string p = base + ".0";
+        const auto sl0_w = get_f32(p + ".scale_layers.0.weight", 1024 * 512 * 4);
+        const auto sl0_b = get_f32(p + ".scale_layers.0.bias",   512);
+        const auto sl2_w = get_f32(p + ".scale_layers.2.weight", 512 * 256 * 4);
+        const auto sl2_b = get_f32(p + ".scale_layers.2.bias",   256);
+        const auto p1_w  = get_f32(p + ".proj1.weight",          256 * 256);
+        const auto p1_b  = get_f32(p + ".proj1.bias",            256);
+        const auto p2_w  = get_f32(p + ".proj2.weight",          256 * 256 * 9);
+        const auto p2_b  = get_f32(p + ".proj2.bias",            256);
+
+        auto t = cpu_conv_transpose2d_k2s2(hs, 1024, kGridSize, kGridSize, 512, sl0_w, sl0_b);
+        // t is now [512, 144, 144]
+        cpu_gelu(t);
+        t = cpu_conv_transpose2d_k2s2(t, 512, kGridSize * 2, kGridSize * 2, 256, sl2_w, sl2_b);
+        // t is now [256, 288, 288]
+        t = cpu_conv2d_1x1(t, 256, kGridSize * 4, kGridSize * 4, 256, p1_w, p1_b);
+        out.bb0 = cpu_conv2d_3x3(t, 256, kGridSize * 4, kGridSize * 4, 256, p2_w, p2_b);
+    }
+
+    // ── FPN layer 1 (scale=2×): ConvT(1024→512) → proj1 (512→256) → proj2 (256→256) ─
+    {
+        const std::string p = base + ".1";
+        const auto sl0_w = get_f32(p + ".scale_layers.0.weight", 1024 * 512 * 4);
+        const auto sl0_b = get_f32(p + ".scale_layers.0.bias",   512);
+        const auto p1_w  = get_f32(p + ".proj1.weight",          256 * 512);
+        const auto p1_b  = get_f32(p + ".proj1.bias",            256);
+        const auto p2_w  = get_f32(p + ".proj2.weight",          256 * 256 * 9);
+        const auto p2_b  = get_f32(p + ".proj2.bias",            256);
+
+        auto t = cpu_conv_transpose2d_k2s2(hs, 1024, kGridSize, kGridSize, 512, sl0_w, sl0_b);
+        t = cpu_conv2d_1x1(t, 512, kGridSize * 2, kGridSize * 2, 256, p1_w, p1_b);
+        out.bb1 = cpu_conv2d_3x3(t, 256, kGridSize * 2, kGridSize * 2, 256, p2_w, p2_b);
+    }
+
+    // ── FPN layer 2 (scale=1×): proj1 (1024→256) → proj2 (256→256) ────────
+    {
+        const std::string p = base + ".2";
+        const auto p1_w  = get_f32(p + ".proj1.weight", 256 * 1024);
+        const auto p1_b  = get_f32(p + ".proj1.bias",   256);
+        const auto p2_w  = get_f32(p + ".proj2.weight", 256 * 256 * 9);
+        const auto p2_b  = get_f32(p + ".proj2.bias",   256);
+
+        auto t = cpu_conv2d_1x1(hs, 1024, kGridSize, kGridSize, 256, p1_w, p1_b);
+        out.bb2 = cpu_conv2d_3x3(t, 256, kGridSize, kGridSize, 256, p2_w, p2_b);
+    }
+
+    return out;
 }
 
 }  // namespace sam3
