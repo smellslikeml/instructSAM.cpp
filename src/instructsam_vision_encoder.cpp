@@ -470,6 +470,18 @@ std::vector<float> InstructsamVisionEncoder::run_prenorm(
     return result;
 }
 
+std::vector<float> InstructsamVisionEncoder::run_all_layers(
+    const std::vector<float> & pixel_values,
+    const std::vector<int64_t> & pixel_shape
+) const {
+    // Patch embed + pos embed + pre-trunk LN → [72*72, 1024]
+    auto hidden = run_prenorm(pixel_values, pixel_shape);
+    for (int layer = 0; layer < kNumLayers; ++layer) {
+        hidden = run_layer(layer, hidden);
+    }
+    return hidden;
+}
+
 std::vector<float> InstructsamVisionEncoder::run_layer(
     int layer_idx, const std::vector<float> & hidden_in
 ) const {

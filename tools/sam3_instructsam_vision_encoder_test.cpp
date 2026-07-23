@@ -48,9 +48,11 @@ double cos_flat(const std::vector<float> & a, const std::vector<float> & b) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc < 2) { std::cerr << "usage: <model.gguf> [parity_dir]\n"; return 1; }
-    const std::string dir = (argc >= 3) ? argv[2]
+    if (argc < 2) { std::cerr << "usage: <model.gguf> [parity_dir] [--full]\n"; return 1; }
+    const std::string dir = (argc >= 3 && argv[2][0] != '-') ? argv[2]
         : "/tmp/pathA_reference/warehouse_rgb/binaries_vision";
+    bool full_mode = false;
+    for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == "--full") full_mode = true;
 
     sam3::GgufModel model;
     if (!model.load(argv[1])) { std::cerr << "load failed\n"; return 2; }
@@ -169,6 +171,49 @@ int main(int argc, char ** argv) {
                   << "    ref[0..3] : " << ref_l0[0]     << " " << ref_l0[1]     << " " << ref_l0[2]     << " " << ref_l0[3]     << "\n";
     }
 
-    std::cout << "\n=== next milestone: layers 1-31 (mostly a loop) ===\n";
+    // ── Milestone 4: per-layer isolated parity for spot-check + all globals ──
+    std::cout << "\n=== milestone 4: per-layer isolated parity ===\n";
+    std::cout << "  (feeds ref layer_{N-1} output → run_layer(N) → compare vs layer_N)\n";
+    std::cout << "  spot-check: layers 1, 2, 6, 7 (global), 8, 15 (global), 23 (global), 31 (global)\n";
+    if (full_mode) std::cout << "  --full: all 32 layers.\n";
+    const std::vector<int> spot_layers = {1, 2, 6, 7, 8, 15, 23, 31};
+    std::vector<int> layers_to_test;
+    if (full_mode) for (int i = 1; i < 32; ++i) layers_to_test.push_back(i);
+    else layers_to_test = spot_layers;
+
+    std::cout << "\n  L  | cos_sim  | max_diff | rel_L2   | runtime\n";
+    std::cout << "  ---+----------+----------+----------+----------\n";
+    int good = 0;
+    for (int layer : layers_to_test) {
+        std::vector<int64_t> in_s, out_s;
+        std::vector<float> layer_in, layer_out_ref;
+        try {
+            char nm[64]; std::snprintf(nm, sizeof(nm), "/layer_%02d.f32", layer - 1);
+            layer_in = read_bin_f32(dir + nm, in_s);
+            std::snprintf(nm, sizeof(nm), "/layer_%02d.f32", layer);
+            layer_out_ref = read_bin_f32(dir + nm, out_s);
+        } catch (...) {
+            std::cout << "  L" << layer << " | (missing reference)\n";
+            continue;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto layer_out = enc.run_layer(layer, layer_in);
+        const auto rt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        double maxd = 0.0, l2d = 0.0, l2r = 0.0;
+        for (size_t i = 0; i < layer_out.size(); ++i) {
+            const double d = static_cast<double>(layer_out[i]) - layer_out_ref[i];
+            if (std::fabs(d) > maxd) maxd = std::fabs(d);
+            l2d += d * d; l2r += static_cast<double>(layer_out_ref[i]) * layer_out_ref[i];
+        }
+        const double cos = cos_flat(layer_out, layer_out_ref);
+        const double rel_l2 = std::sqrt(l2d) / std::sqrt(l2r);
+        if (cos > 0.99) ++good;
+        std::cout << "  L" << (layer < 10 ? "0" : "") << layer
+                  << " | " << cos << " | " << maxd << " | " << rel_l2 << " | " << rt_ms << " ms\n";
+    }
+    std::cout << "\n  " << good << "/" << layers_to_test.size() << " layers achieved cos_sim > 0.99\n";
+
+    std::cout << "\n=== next milestone: FPN neck (3-stage upsampling with proj1/proj2/scale_layers) ===\n";
     return 0;
 }

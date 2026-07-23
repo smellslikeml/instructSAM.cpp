@@ -69,8 +69,14 @@ public:
     // on Q and K) → residual → LN2 → MLP (GELU) → residual.
     std::vector<float> run_layer(int layer_idx, const std::vector<float> & hidden) const;
 
-    // Full 32-layer forward pass. TODO after layer 0 lands.
-    // std::vector<float> run(...) const;
+    // Full trunk forward: patch_embed + pos_embed + pre_layer_norm + all
+    // 32 encoder layers. Returns [72*72, 1024] final hidden state
+    // (equivalent to vision_encoder.backbone.last_hidden_state before
+    // the FPN neck reshapes it). Runtime ~20 min on CPU (32×~40s).
+    std::vector<float> run_all_layers(
+        const std::vector<float> & pixel_values,
+        const std::vector<int64_t> & pixel_shape
+    ) const;
 
 private:
     const GgufModel & model_;
