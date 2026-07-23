@@ -156,6 +156,29 @@ def main() -> int:
     hooks.hook(gm.vision_encoder.neck, "vision_encoder_neck")
     hooks.hook(gm.vision_encoder, "vision_encoder")
 
+    # SAM3 ViT internals — enables per-layer parity validation for the port.
+    hooks.hook(gm.vision_encoder.backbone.embeddings.patch_embeddings,
+               "vision_backbone__patch_embed")
+    hooks.hook(gm.vision_encoder.backbone.embeddings,
+               "vision_backbone__embeddings")
+    hooks.hook(gm.vision_encoder.backbone.layer_norm,
+               "vision_backbone__pre_layer_norm")
+    for i, layer in enumerate(gm.vision_encoder.backbone.layers):
+        hooks.hook(layer, f"vision_backbone__layer_{i:02d}")
+
+    # Also capture pixel_values that get fed to the vision backbone so we can
+    # feed them directly to our C++ port without recomputing preprocessing.
+    vb_inputs = {}
+    def _vb_pre_hook(_mod, args, kwargs):
+        if "pixel_values" not in vb_inputs:
+            pv = kwargs.get("pixel_values")
+            if pv is None and args:
+                pv = args[0]
+            if pv is not None:
+                vb_inputs["pixel_values"] = pv
+    hooks._handles.append(gm.vision_encoder.backbone.register_forward_pre_hook(
+        _vb_pre_hook, with_kwargs=True))
+
     # DETR encoder (fusion stage)
     hooks.hook(gm.detr_encoder, "detr_encoder")
     for i, layer in enumerate(gm.detr_encoder.layers):
@@ -246,6 +269,11 @@ def main() -> int:
         safe = name.replace("::", "__").replace("/", "_")
         save_tensor(tensor, out_dir / f"{safe}.pt", name,
                     manifest["tensors"])
+
+    # Vision backbone input pixel_values
+    if "pixel_values" in vb_inputs:
+        save_tensor(vb_inputs["pixel_values"], out_dir / "vision_backbone_in__pixel_values.pt",
+                    "vision_backbone_in::pixel_values", manifest["tensors"])
 
     # Mask decoder inputs captured via pre-hook
     if "decoder_queries" in md_inputs:
