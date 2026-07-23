@@ -36,19 +36,32 @@ public:
     // ggml graph implementation begins.
     size_t validate_all_tensors_present() const;
 
-    // Full graph implementation — TODO in a subsequent commit.
-    // DecoderOutput run(
-    //     const std::vector<float> & text_memory,
-    //     const std::vector<int64_t> & text_memory_shape,
-    //     const std::vector<float> & vision_memory,
-    //     const std::vector<int64_t> & vision_memory_shape,
-    //     const std::vector<float> & pos_embed,
-    //     const std::vector<int64_t> & pos_shape,
-    //     const std::vector<float> & seg_hidden_states,       // from LM at mask_queries positions
-    //     const std::vector<int64_t> & seg_hidden_states_shape,
-    //     const std::vector<float> & phrase_embeddings,       // text_hidden_fcs output
-    //     const std::vector<int64_t> & phrase_embeddings_shape
-    // ) const;
+    // Full decoder graph — 6 layers of self_attn + text_cross_attn +
+    // vision_cross_attn + MLP, with post-norm placement. Inputs:
+    //   - queries: initial decoder queries [num_queries, 256] — typically
+    //     mask_hidden_fcs output on LM hidden states at mask_queries positions
+    //   - text_memory: text keys/values [text_seq, 256] — text_hidden_fcs
+    //     output on phrase embeddings
+    //   - vision_memory: vision keys/values [hw, 256] — output of
+    //     detr_encoder (which already fused vision + text upstream)
+    //   - vision_pos: vision position embeddings [hw, 256]
+    //   - text_mask: attention mask over text_memory [text_seq]
+    //
+    // Returns per-layer hidden states + reference boxes. Presence-token
+    // machinery is omitted (InstructSAM uses per-slot cls_score from
+    // dot_product_scoring downstream, not presence prediction here).
+    DecoderOutput run(
+        const std::vector<float> & queries,
+        const std::vector<int64_t> & queries_shape,
+        const std::vector<float> & text_memory,
+        const std::vector<int64_t> & text_memory_shape,
+        const std::vector<float> & vision_memory,
+        const std::vector<int64_t> & vision_memory_shape,
+        const std::vector<float> & vision_pos,
+        const std::vector<int64_t> & vision_pos_shape,
+        const std::vector<float> & text_mask,
+        const std::vector<int64_t> & text_mask_shape
+    ) const;
 
 private:
     const GgufModel & model_;
