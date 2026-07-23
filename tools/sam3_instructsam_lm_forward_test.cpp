@@ -5,8 +5,10 @@
 #include "sam3/gguf_model.h"
 #include "sam3/instructsam_lm_forward.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -91,7 +93,53 @@ int main(int argc, char ** argv) {
         std::cout << "  (skipping — safetensors dumps not found: " << e.what() << ")\n";
     }
 
-    std::cout << "\n=== Qwen3 fork Day 1 done — embed lookup working ===\n";
-    std::cout << "  Next: skeleton for run_layer(0), then RMSNorm + q_norm/k_norm + GQA + RoPE + SwiGLU MLP\n";
+    // ── Milestone 4: full 28-layer forward pass, smoke check ────────────
+    std::cout << "\n=== forward pass: 4-token sequence through 28 layers ===\n";
+    std::cout << "  building input embeddings...\n" << std::flush;
+    // Small test: 4 tokens = [ref_start, "test-token", ref_end, mask_start]
+    // Just for a NaN check and rough magnitude check.
+    const std::vector<int32_t> tok_ids = {151646, 9707, 151647, 151671};
+    std::vector<float> input_embeds(tok_ids.size() * 2048);
+    for (size_t i = 0; i < tok_ids.size(); ++i) {
+        const auto e = lm.embed_for_token(tok_ids[i]);
+        std::memcpy(input_embeds.data() + i * 2048, e.data(), 2048 * sizeof(float));
+    }
+    std::vector<int32_t> positions;
+    for (size_t i = 0; i < tok_ids.size(); ++i) positions.push_back(static_cast<int32_t>(i));
+
+    std::cout << "  running 28-layer forward pass (CPU, expect ~30-60s)...\n" << std::flush;
+    auto t0 = std::chrono::steady_clock::now();
+    const auto final_hidden = lm.run(input_embeds, static_cast<int64_t>(tok_ids.size()), positions);
+    const auto rt = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::cout << "  ✓ ran in " << rt << " ms\n";
+
+    // Sanity check
+    int nan_count = 0, zero_count = 0;
+    float absmax = 0.0f;
+    double sum = 0.0;
+    for (float v : final_hidden) {
+        if (std::isnan(v) || std::isinf(v)) ++nan_count;
+        else if (v == 0.0f) ++zero_count;
+        else { sum += v; if (std::fabs(v) > absmax) absmax = std::fabs(v); }
+    }
+    std::cout << "  final_hidden: total=" << final_hidden.size()
+              << "  NaN/Inf=" << nan_count
+              << "  zeros=" << zero_count
+              << "  absmax=" << absmax
+              << "  mean=" << (sum / final_hidden.size()) << "\n";
+    for (size_t i = 0; i < tok_ids.size(); ++i) {
+        std::cout << "  pos " << i << " hidden[0..3]: "
+                  << final_hidden[i*2048+0] << " " << final_hidden[i*2048+1]
+                  << " " << final_hidden[i*2048+2] << " " << final_hidden[i*2048+3] << "\n";
+    }
+
+    std::cout << "\n=== Qwen3 fork Day 3-4 done — full 28-layer forward compiles + runs ===\n";
+    if (nan_count == 0) {
+        std::cout << "  ✓ no NaN/Inf → structural correctness OK\n";
+    } else {
+        std::cout << "  ✗ " << nan_count << " NaN/Inf values — investigate\n";
+    }
+    std::cout << "  Next: parity vs. PyTorch InstructSAM reference (needs LM layer hooks in capture harness)\n";
     return 0;
 }

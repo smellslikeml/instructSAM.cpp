@@ -51,6 +51,27 @@ public:
     // Throws on first missing. Returns count probed.
     size_t validate_all_tensors_present() const;
 
+    // Full forward pass on a sequence of position-embed pairs.
+    //
+    // Input: `embeds` [seq_len, 2048] — the input embeddings for each
+    //   position. Caller looks up token embeds via embed_for_token, and can
+    //   substitute any position with a custom embed (e.g. mask_queries for
+    //   InstructSAM's injection at ref_end).
+    // Input: `positions` [seq_len] — position IDs for RoPE. For a
+    //   contiguous decode this is just 0, 1, 2, .... For M-RoPE variants
+    //   the caller supplies whatever is right (text-only reduces to 1D).
+    //
+    // Output: final hidden states [seq_len, 2048] AFTER output_norm.
+    //
+    // Uses causal attention. No KV cache (recomputes full attention each
+    // call — fine for our small ~10-token injection use case; can add
+    // caching later for full generation loops if needed).
+    std::vector<float> run(
+        const std::vector<float> & embeds,
+        int64_t seq_len,
+        const std::vector<int32_t> & positions
+    ) const;
+
     // Look up a token's INPUT embedding from token_embd.weight.
     // Handy for building the phrase_embeddings input to text_hidden_fcs
     // (piece 4b). Also for constructing the initial embed sequence in the
