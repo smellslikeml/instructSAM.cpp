@@ -139,6 +139,24 @@ integration bugs surface immediately.
 If SAM3 vision encoder work parallelizes to a dedicated session/agent
 while another does Piece 4/4b/5, calendar time drops closer to 2 weeks.
 
+## Update — Piece 1 (SAM3 vision) landed + Piece 3 rescoped
+
+**Piece 1 (SAM3 vision encoder) — COMPLETE** (2026-07-23):
+- 32-layer ViT trunk + FPN neck all in ggml
+- 5-milestone parity harness — all layers cos-sim 0.99999+
+- Vision-native E2E (pixel_values → pred_masks) proven — cos-sim 0.9986 vs. PyTorch
+
+**Piece 3 (LM integration) — RESCOPED from "weeks" to ~3-5 days**:
+The PATH-B-RECIPE originally concluded that InstructSAM's embedding-injection
+mechanism would need "several weeks of ggml C++ engineering" to add to
+llama.cpp. Turns out llama.cpp's public C API already supports both
+`llama_batch.embd` (mid-generation inputs_embeds) and
+`llama_get_embeddings_ith` (hidden-state capture). See
+`docs/instructsam/LM_INTEGRATION_PLAN.md` for the API surface + day-by-day
+plan.
+
+**Revised Milestone 3 estimate: ~1.5 weeks** (was 2-4).
+
 ## What's in the branch RIGHT NOW that's usable
 
 Anyone can already:

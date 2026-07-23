@@ -4,6 +4,14 @@
 end-to-end. `[SEG]` token emission from the converted LM diverges from the
 PyTorch reference (see "Open issue" below) — investigation deferred.
 
+**Update (later):** The "Open issue" section below concludes that InstructSAM's
+embedding-injection mechanism requires "several weeks of ggml C++ engineering"
+to add to llama.cpp. **That conclusion was wrong** — llama.cpp's public API
+already supports both mid-generation inputs_embeds (via `llama_batch.embd`)
+and hidden-state capture at specific positions (via `llama_get_embeddings_ith`).
+See `docs/instructsam/LM_INTEGRATION_PLAN.md` for the correct API surface and
+the ~3-5 day integration plan.
+
 Path B produces GGUF artifacts for InstructSAM's Qwen3-VL LM + vision projector,
 using llama.cpp's existing Qwen3-VL support with a small tensor-filter patch to
 skip the grounding_model half (which Path A handles separately via a

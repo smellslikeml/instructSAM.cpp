@@ -85,6 +85,7 @@ add_library(sam3cpp
     src/instructsam_detr_encoder.cpp
     src/instructsam_lm_bridge.cpp
     src/instructsam_vision_encoder.cpp
+    src/instructsam_lm_runner.cpp
     src/encoder_fusion.cpp
     src/geometry_encoder.cpp
     src/grounding_head.cpp
@@ -125,6 +126,7 @@ add_library(sam3cpp_static STATIC
     src/instructsam_detr_encoder.cpp
     src/instructsam_lm_bridge.cpp
     src/instructsam_vision_encoder.cpp
+    src/instructsam_lm_runner.cpp
     src/encoder_fusion.cpp
     src/geometry_encoder.cpp
     src/grounding_head.cpp
