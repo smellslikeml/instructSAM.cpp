@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -39,6 +40,14 @@ from pathlib import Path
 
 import numpy as np
 from safetensors import safe_open
+
+# sam3cpp's schema lives in its bundled llama.cpp gguf-py checkout.
+# Also common: system-installed gguf. Try both.
+try:
+    from gguf import GGMLQuantizationType, GGUFWriter
+except ImportError:
+    print("✗ gguf module not available; install with `pip install gguf`", file=sys.stderr)
+    sys.exit(1)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -198,18 +207,112 @@ def main() -> int:
         return 0 if not unmapped else 2
 
     # ── GGUF emission ──────────────────────────────────────────────────
-    # NOT implemented in this first pass. The mapping is the interesting
-    # part; the actual GGUFWriter invocation is straightforward
-    # (see convert_mlx_sam3_to_gguf.py for reference). Deferred until:
-    #   1. Mapping-coverage is 100% (no unmapped tensors)
-    #   2. sam3cpp's decoder graph supports double-cross-attn (see DESIGN.md)
+    # Schema follows sam3cpp's convention (convert_mlx_sam3_to_gguf.py):
+    #   - short tensor names in the GGUF: t_<sha1(canonical_name)[:12]>
+    #   - .tensor_map.json sidecar maps short_name → canonical_name
+    #   - sam3cpp's runtime looks up by canonical name, resolves via alias
     #
-    # Emitting GGUF without (2) produces a file sam3cpp will "load" but
-    # can't run correctly — worse than not emitting at all.
-    print(f"\n⚠ GGUF emission not implemented in this first pass.")
-    print(f"  Blocking on: DESIGN.md's decoder-graph modifications.")
-    print(f"  Use --dry-run to validate mapping coverage in the meantime.")
-    return 3
+    # Quantization: F16 for large weight matrices; F32 for sensitive tensors
+    # (norm / bias / small vectors) to avoid dequant drift accumulating.
+    if not args.output:
+        print("✗ --output required (unless --dry-run)", file=sys.stderr)
+        return 1
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    writer = GGUFWriter(str(args.output), "sam3")
+    writer.add_name("instructsam-2b")
+    writer.add_string("sam3.source_repo", "CircleRadon/InstructSAM-2B")
+    writer.add_string("sam3.variant", "instructsam")
+    writer.add_string("sam3.task", "image-segmentation")
+    writer.add_string("general.quantized_by",
+                      "sam3cpp-fork/tools/convert_instructsam_to_gguf.py")
+    # SAM3 vision parameters (matches Meta's SAM3 image encoder)
+    writer.add_int32("sam3.image_size", 1008)
+    writer.add_int32("sam3.patch_size", 14)
+    # InstructSAM decoder variant signal — runtime switches on this
+    writer.add_bool("sam3.instructsam.double_cross_attn", True)
+    writer.add_bool("sam3.instructsam.skip_encoder_fusion", False)  # keep for now; instructsam DOES use encoder
+    # Note: text_layers is 0 because InstructSAM feeds LM embeddings externally
+    # (no built-in text encoder in the grounding_model)
+    writer.add_int32("sam3.text_layers", 0)
+
+    # Determine per-tensor dtype
+    def target_qtype(canonical_name: str, tensor: np.ndarray) -> GGMLQuantizationType:
+        """F32 for sensitive tensors; F16 for the rest."""
+        lower = canonical_name.lower()
+        # Norms, biases, small position embeddings — keep at F32 to avoid
+        # cumulative dequant error at ε-sensitive positions
+        if lower.endswith(".bias"):
+            return GGMLQuantizationType.F32
+        if "norm" in lower or "layernorm" in lower:
+            return GGMLQuantizationType.F32
+        # Small vectors (embeddings for special tokens etc.) — F32
+        if tensor.ndim <= 1 or tensor.size < 4096:
+            return GGMLQuantizationType.F32
+        return GGMLQuantizationType.F16
+
+    def short_name(canonical: str) -> str:
+        return "t_" + hashlib.sha1(canonical.encode()).hexdigest()[:12]
+
+    # Deduplicate — sha1 collisions on 12 hex = 48 bits, extremely improbable
+    # for our N<2000 tensors but we detect if it ever happens
+    seen_shortnames: dict[str, str] = {}
+    tensor_map: dict[str, str] = {}
+    dtype_counts: dict[str, int] = defaultdict(int)
+    total_out_bytes = 0
+
+    print(f"\n=== writing GGUF: {args.output} ===")
+    # Use torch backend for safetensors — numpy can't handle bfloat16 which
+    # InstructSAM's checkpoint uses for most weights.
+    import torch as _t
+    with safe_open(str(args.input), framework="pt") as handle:
+        for src_name, canonical_name, shape in mapped:
+            t = handle.get_tensor(src_name)  # torch.Tensor, possibly bfloat16
+
+            # Choose output dtype based on canonical name
+            fake_np = np.zeros(t.shape, dtype=np.float32)  # shape-only for qtype decision
+            qtype = target_qtype(canonical_name, fake_np)
+
+            if qtype == GGMLQuantizationType.F16:
+                stored = t.to(_t.float16).contiguous().numpy()
+            else:
+                stored = t.to(_t.float32).contiguous().numpy()
+
+            sn = short_name(canonical_name)
+            if sn in seen_shortnames:
+                raise RuntimeError(
+                    f"sha1 collision: {sn} maps to both "
+                    f"{seen_shortnames[sn]!r} and {canonical_name!r}"
+                )
+            seen_shortnames[sn] = canonical_name
+            tensor_map[sn] = canonical_name
+
+            if qtype == GGMLQuantizationType.F16:
+                writer.add_tensor(sn, stored)
+            else:
+                writer.add_tensor(sn, stored, raw_dtype=qtype)
+
+            dtype_counts[qtype.name] += 1
+            total_out_bytes += stored.nbytes
+
+    writer.add_uint64("sam3.tensor_count", len(tensor_map))
+    print(f"  writing {len(tensor_map)} tensors to disk...")
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    # Sidecar map — canonical_name → short_name (and also short→canonical
+    # per sam3cpp's convention of populating both directions)
+    sidecar = args.output.with_suffix(args.output.suffix + ".tensor_map.json")
+    sidecar.write_text(json.dumps(tensor_map, indent=2, sort_keys=True))
+    print(f"  writing sidecar: {sidecar}")
+
+    print(f"\n=== emission complete ===")
+    print(f"  gguf:    {args.output}  ({total_out_bytes / 1024 / 1024:.1f} MB)")
+    print(f"  sidecar: {sidecar}  ({sidecar.stat().st_size} bytes)")
+    print(f"  dtypes:  {dict(dtype_counts)}")
+    return 0
 
 
 if __name__ == "__main__":
