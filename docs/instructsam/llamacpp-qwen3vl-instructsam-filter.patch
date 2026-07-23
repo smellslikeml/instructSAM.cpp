@@ -1,0 +1,21 @@
+diff --git a/conversion/qwen3vl.py b/conversion/qwen3vl.py
+index 9f11757..b101037 100644
+--- a/conversion/qwen3vl.py
++++ b/conversion/qwen3vl.py
+@@ -264,6 +264,16 @@ class Qwen3VLTextModel(Qwen3Model):
+ 
+         name = name.replace("thinker.", "")
+ 
++        # LOCAL PATCH: InstructSAM wraps Qwen3-VL and adds a SAM3-derived
++        # grounding_model submodule that this converter shouldn't touch.
++        # Skip those tensors here; the grounding_model is handled by a
++        # separate sam3cpp-fork conversion path.
++        if name.startswith("model.grounding_model.") \
++                or name.startswith("model.mask_hidden_fcs.") \
++                or name.startswith("model.text_hidden_fcs.") \
++                or name == "model.mask_queries":
++            return None
++
+         return super().filter_tensors((name, gen))
+ 
+ 
