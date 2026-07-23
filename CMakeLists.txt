@@ -244,6 +244,8 @@ if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
     target_include_directories(sam3-instructsam-llama-probe PRIVATE
         "${LLAMA_CPP_ROOT}/include"
         "${LLAMA_CPP_ROOT}/ggml/include")
+    target_compile_definitions(sam3-instructsam-llama-probe PRIVATE
+        GGML_USE_CPU)
     find_package(Threads REQUIRED)
     find_package(OpenMP REQUIRED)
     # ggml-cpu contains backend init code that would be dropped without a

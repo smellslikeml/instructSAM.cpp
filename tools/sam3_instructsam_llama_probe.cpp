@@ -43,7 +43,14 @@ int main(int argc, char ** argv) {
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 512;
-    cp.embeddings = true;
+    cp.embeddings = true;   // ← the key flag for hidden-state capture
+    cp.pooling_type = LLAMA_POOLING_TYPE_NONE;  // per-token embeddings, not pooled
+    cp.no_perf   = true;
+    // Match mtmd-cli defaults where possible
+    cp.n_batch = 512;
+    cp.n_ubatch = 512;
+    cp.n_threads = 4;
+    cp.n_threads_batch = 4;
     std::cerr << "PROBE: creating ctx\n" << std::flush;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { std::cerr << "ctx failed\n"; return 3; }
@@ -74,7 +81,7 @@ int main(int argc, char ** argv) {
             b.pos[i]       = static_cast<llama_pos>(i);
             b.n_seq_id[i]  = 1;
             b.seq_id[i][0] = 0;
-            b.logits[i]    = (i + 1 == toks.size()) ? 1 : 0;
+            b.logits[i]    = 1;   // request all outputs (embeddings mode needs this)
         }
         b.n_tokens = toks.size();
         if (llama_decode(ctx, b) < 0) {
