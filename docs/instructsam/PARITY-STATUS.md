@@ -101,34 +101,69 @@ Full seg-head chain (FPN → mask_tail → pred_masks vs md_pred_masks):
 
 Runtime: ~11s CPU for the full FPN + mask_tail per object.
 
-## What's still deferred
+## Mask decoder — prompt_cross_attn (PCA)
 
-**prompt_cross_attn** (~4-6 hours C++) — the last remaining component
-before the segmentation half runs without any Python-computed inputs.
+**InstructsamPromptCrossAttn now wired**
+(src/instructsam_prompt_cross_attn.cpp). LayerNorm + Sam3Attention with
+padding-mask handling + residual add. Consumes raw encoder_hidden_states
++ prompt_features + prompt_mask; outputs the post-PCA encoder that feeds
+pixel_decoder's coarsest FPN input.
 
-Currently the dump script synthesizes post-prompt-cross-attn encoder as
-`raw_encoder + prompt_cross_attn_output` (reusing already-captured
-tensors), so we can validate FPN + mask_tail without wiring PCA yet.
-The math is standard:
-- LayerNorm on encoder_hidden_states
-- Cross-attention (Q=normed_encoder, K=V=prompt_features,
-  mask=bidirectional_mask from prompt_mask)
-- Residual add attention output back to raw encoder_hidden_states
-- Output feeds pixel_decoder + becomes the coarsest FPN input
+Mask semantics: prompt_mask is bool in PyTorch (True=valid,
+False=padding). Dumped as float (1.0/0.0). C++ converts to f16 additive
+attention mask: positions where mask ≤ 0.5 get -inf, others get 0.
 
-Uses same Sam3Attention structure as decoder cross-attn (already ported).
+## Full segmentation-head E2E parity
 
-Once PCA lands, the flow is:
+`sam3-instructsam-seg-head-e2e` runs the whole chain in native ggml from
+mask_decoder's raw inputs:
+
 ```
-backbone_features + encoder + prompt_features + prompt_mask
-  → prompt_cross_attn
-  → pixel_decoder (FPN)
-  → mask_tail
-  → pred_masks + semantic_seg
+PCA(encoder, prompt_features, prompt_mask) → post_encoder
+FPN(bb0, bb1, reshape(post_encoder → [256,72,72])) → pixel_embed
+mask_tail(pixel_embed, decoder_queries)          → pred_masks + semantic_seg
 ```
 
-Then wrap in a batch loop (4 objects) and the segmentation half is
-complete. LM half comes from Path B's llama.cpp Qwen3-VL runtime.
+Warehouse_rgb.jpg object 0 (heavy padding: 3/32 valid prompt tokens):
+
+| Stage | Cos-sim | Max diff | Rel L2 |
+|---|---|---|---|
+| PCA post_encoder | 1.000000 | 0.0014 | 0.009% |
+| PCA attn_out (isolated) | 0.999998 | 0.0014 | 0.18% |
+| FPN pixel_embed | 0.999997 | 0.017 | 0.25% |
+| mask_tail pred_masks | **0.999998** | 0.10 | 0.17% |
+
+Runtime: ~10.7s CPU per object for the full seg-head chain.
+
+**The segmentation half of InstructSAM now runs natively in ggml with no
+Python-computed inputs**, given raw mask_decoder inputs. Only LM half
+remains (already available via Path B's llama.cpp Qwen3-VL support).
+
+## What's still needed for full pixel_values → masks
+
+The seg-head chain takes `encoder_hidden_states`, `prompt_features`,
+`prompt_mask`, `backbone_features`, and `decoder_queries` as inputs.
+Everything downstream of those is now ggml-native. What produces those:
+
+- **encoder_hidden_states** — output of detr_encoder (fusion between
+  vision backbone features and text_features). Six DETR encoder layers,
+  same Sam3Attention structure as the decoder we already ported. Would
+  be a smaller-effort fork of the same pattern (~1 day estimate).
+- **decoder_queries** — output of detr_decoder (already ggml-native as
+  of step 2e — the InstructsamDecoder we built earlier).
+- **prompt_features, prompt_mask** — text encoder output (CLIP text
+  model) + tokenization. Text encoder wiring is straightforward but
+  needs GGUF conversion of the CLIP text weights too.
+- **backbone_features** — vision encoder (Sam3ViT + FPN neck) forward.
+  Substantial component but with lots of prior art in sam3cpp and
+  llama.cpp's mtmd path (Path B's `qwen3vl.cpp`).
+
+Batch loop over 4 objects is trivial (~30 min) once the above land.
+The CLI orchestrator would combine llama.cpp (LM + mask_hidden_fcs) +
+our detr_encoder + detr_decoder + PCA/FPN/mask_tail for full inference.
+
+At that point: `image.jpg + query text → pred_masks.pt` end-to-end in
+native ggml. That's the Path A goal.
 
 ## Iteration ledger — full path A journey so far
 

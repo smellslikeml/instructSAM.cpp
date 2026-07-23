@@ -45,6 +45,12 @@ DUMPS = [
     # that below via a separate computation.
     ("mask_decoder_in__backbone_features_0.pt",  "md_fpn_bb0"),
     ("mask_decoder_in__backbone_features_1.pt",  "md_fpn_bb1"),
+    # Prompt cross-attention (PCA) inputs + intermediates
+    ("mask_decoder_in__encoder_hidden_states.pt", "md_pca_encoder_in"),
+    ("mask_decoder_in__prompt_features.pt",       "md_pca_prompt_features"),
+    ("mask_decoder_in__prompt_mask.pt",           "md_pca_prompt_mask"),
+    ("mask_decoder__prompt_cross_attn_norm.pt",   "md_pca_normed"),
+    ("mask_decoder__prompt_cross_attn.pt",        "md_pca_attn_out"),
 ]
 
 
