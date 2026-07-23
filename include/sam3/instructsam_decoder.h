@@ -56,6 +56,11 @@ public:
     // for now this test harness accepts an externally-computed layer-0
     // query_pos and reuses it — good enough for layer-0 numerical parity.
     // Pass empty vector to disable (uses zeros — for structural smoke only).
+    // Optional:
+    //   query_pos: [10, 256]. Empty → zeros (structural smoke only).
+    //   initial_reference_boxes: [10, 4] in (cx,cy,w,h) sigmoid space; needed
+    //     to compute vision cross-attn box_rpb bias. Empty → no bias (bad
+    //     numerical parity, structural smoke only).
     DecoderOutput run(
         const std::vector<float> & queries,
         const std::vector<int64_t> & queries_shape,
@@ -67,7 +72,8 @@ public:
         const std::vector<int64_t> & vision_pos_shape,
         const std::vector<float> & text_mask,
         const std::vector<int64_t> & text_mask_shape,
-        const std::vector<float> & query_pos = {}
+        const std::vector<float> & query_pos = {},
+        const std::vector<float> & initial_reference_boxes = {}
     ) const;
 
 private:

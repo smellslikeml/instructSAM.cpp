@@ -174,6 +174,16 @@ int main(int argc, char ** argv) {
             std::cout << "  (no query_pos file — falling back to zeros: " << e.what() << ")\n";
         }
 
+        // initial reference boxes for box_rpb bias in vision cross-attn
+        std::vector<int64_t> rps;
+        std::vector<float> init_ref_boxes;
+        try {
+            init_ref_boxes = read_bin_f32(parity_dir + "/initial_reference_points.f32", rps);
+            std::cout << "  init_ref_boxes shape=[" << rps[0] << "," << rps[1] << "]\n";
+        } catch (const std::exception & e) {
+            std::cout << "  (no init_reference_points — no vision_bias: " << e.what() << ")\n";
+        }
+
         try {
             const sam3::DecoderOutput out = decoder.run(
                 queries,       qs,
@@ -181,7 +191,8 @@ int main(int argc, char ** argv) {
                 vision_memory, vms,
                 vision_pos,    vps,
                 text_mask,     {tms[0]},
-                query_pos);
+                query_pos,
+                init_ref_boxes);
 
             const int nq  = out.num_queries;
             const int dim = out.hidden_dim;

@@ -95,6 +95,116 @@ std::string layer_prefix(int layer) {
     return "transformer.decoder.layers." + std::to_string(layer);
 }
 
+// InstructSAM box relative position bias — mathematically identical to
+// sam3cpp's build_box_rpb_bias, but with the presence-token slot removed
+// (output shape is [heads, num_queries, hw] instead of [heads, num_queries+1, hw]).
+//
+// The RPB matrix is an additive bias on attention scores in the vision
+// cross-attention block. For each (query, head, spatial-position h*w) it
+// encodes how far that spatial position is from the query's predicted
+// box edges, log-scaled and passed through a small 2-layer MLP. Verified
+// against InstructSAM's _get_rpb_matrix (modeling_sam3.py:1644-1689) —
+// identical arithmetic modulo the presence-token offset.
+//
+// Reference boxes are in (cx, cy, w, h) format, sigmoid-space (0..1).
+std::vector<float> build_instructsam_box_rpb_bias(
+    const std::vector<float> & reference_boxes,
+    int64_t num_queries,
+    int64_t feat_h,
+    int64_t feat_w,
+    const std::vector<float> & mlp_x_0_w,   // box_rpb_embed_x.layer1.weight [256, 2]
+    const std::vector<float> & mlp_x_0_b,   // .layer1.bias   [256]
+    const std::vector<float> & mlp_x_1_w,   // .layer2.weight [heads, 256]
+    const std::vector<float> & mlp_x_1_b,   // .layer2.bias   [heads]
+    const std::vector<float> & mlp_y_0_w,
+    const std::vector<float> & mlp_y_0_b,
+    const std::vector<float> & mlp_y_1_w,
+    const std::vector<float> & mlp_y_1_b
+) {
+    std::vector<float> coords_h(static_cast<size_t>(feat_h));
+    std::vector<float> coords_w(static_cast<size_t>(feat_w));
+    for (int64_t i = 0; i < feat_h; ++i) {
+        coords_h[static_cast<size_t>(i)] = static_cast<float>(i) / static_cast<float>(feat_h);
+    }
+    for (int64_t i = 0; i < feat_w; ++i) {
+        coords_w[static_cast<size_t>(i)] = static_cast<float>(i) / static_cast<float>(feat_w);
+    }
+
+    auto mlp2 = [](const std::vector<float> & in,
+                   const std::vector<float> & w0, const std::vector<float> & b0,
+                   const std::vector<float> & w1, const std::vector<float> & b1,
+                   int64_t out0, int64_t out1) {
+        std::vector<float> h(static_cast<size_t>(out0));
+        for (int64_t o = 0; o < out0; ++o) {
+            float sum = b0[static_cast<size_t>(o)];
+            for (size_t i = 0; i < in.size(); ++i) {
+                sum += w0[static_cast<size_t>(o * static_cast<int64_t>(in.size()) +
+                                             static_cast<int64_t>(i))] * in[i];
+            }
+            h[static_cast<size_t>(o)] = std::max(0.0f, sum);   // ReLU
+        }
+        std::vector<float> out(static_cast<size_t>(out1));
+        for (int64_t o = 0; o < out1; ++o) {
+            float sum = b1[static_cast<size_t>(o)];
+            for (int64_t i = 0; i < out0; ++i) {
+                sum += w1[static_cast<size_t>(o * out0 + i)] * h[static_cast<size_t>(i)];
+            }
+            out[static_cast<size_t>(o)] = sum;
+        }
+        return out;
+    };
+
+    std::vector<float> out(static_cast<size_t>(kHeads * num_queries * feat_h * feat_w), 0.0f);
+    for (int64_t q = 0; q < num_queries; ++q) {
+        const float cx = reference_boxes[static_cast<size_t>(q * 4 + 0)];
+        const float cy = reference_boxes[static_cast<size_t>(q * 4 + 1)];
+        const float bw = reference_boxes[static_cast<size_t>(q * 4 + 2)];
+        const float bh = reference_boxes[static_cast<size_t>(q * 4 + 3)];
+        const float x0 = cx - 0.5f * bw;
+        const float x1 = cx + 0.5f * bw;
+        const float y0 = cy - 0.5f * bh;
+        const float y1 = cy + 0.5f * bh;
+
+        std::vector<std::vector<float>> dx(static_cast<size_t>(feat_w));
+        std::vector<std::vector<float>> dy(static_cast<size_t>(feat_h));
+        for (int64_t x = 0; x < feat_w; ++x) {
+            std::vector<float> in = {
+                coords_w[static_cast<size_t>(x)] - x0,
+                coords_w[static_cast<size_t>(x)] - x1,
+            };
+            for (float & v : in) {
+                v *= 8.0f;
+                v = std::copysign(std::log2(std::fabs(v) + 1.0f) / std::log2(8.0f), v);
+            }
+            dx[static_cast<size_t>(x)] = mlp2(in, mlp_x_0_w, mlp_x_0_b, mlp_x_1_w, mlp_x_1_b, kModelDim, kHeads);
+        }
+        for (int64_t y = 0; y < feat_h; ++y) {
+            std::vector<float> in = {
+                coords_h[static_cast<size_t>(y)] - y0,
+                coords_h[static_cast<size_t>(y)] - y1,
+            };
+            for (float & v : in) {
+                v *= 8.0f;
+                v = std::copysign(std::log2(std::fabs(v) + 1.0f) / std::log2(8.0f), v);
+            }
+            dy[static_cast<size_t>(y)] = mlp2(in, mlp_y_0_w, mlp_y_0_b, mlp_y_1_w, mlp_y_1_b, kModelDim, kHeads);
+        }
+
+        for (int64_t h = 0; h < kHeads; ++h) {
+            for (int64_t y = 0; y < feat_h; ++y) {
+                for (int64_t x = 0; x < feat_w; ++x) {
+                    const int64_t src = y * feat_w + x;
+                    const size_t idx = static_cast<size_t>(
+                        ((h * num_queries + q) * (feat_h * feat_w)) + src);
+                    out[idx] = dy[static_cast<size_t>(y)][static_cast<size_t>(h)] +
+                               dx[static_cast<size_t>(x)][static_cast<size_t>(h)];
+                }
+            }
+        }
+    }
+    return out;
+}
+
 // Per-layer names using InstructSAM's native naming (q_proj / self_attn_layer_norm
 // / mlp.fc1 / etc.). The dual-aliased GGUF also provides sam3cpp's stock names,
 // so either works — using InstructSAM's since it's what appears in checkpoint
@@ -125,7 +235,8 @@ ggml_tensor * build_layer(
     ggml_tensor * text_mask,       // [text_seq, kNumQueries] f16 mask
     ggml_tensor * vision_memory,   // [hw, kModelDim]
     ggml_tensor * vision_pos,      // [hw, kModelDim]
-    int32_t hw
+    int32_t hw,
+    ggml_tensor * vision_mask      // [hw, kNumQueries, kHeads, 1] f32 RPB bias (may be nullptr)
 ) {
     const int32_t nq = kNumQueries;
 
@@ -173,7 +284,7 @@ ggml_tensor * build_layer(
                      require_tensor(model, prefix_attn_qkvo(layer, "vision_cross_attn", "k_proj", "bias")), vision_k),
         linear(ctx, require_tensor(model, prefix_attn_qkvo(layer, "vision_cross_attn", "v_proj", "weight")),
                      require_tensor(model, prefix_attn_qkvo(layer, "vision_cross_attn", "v_proj", "bias")), vision_memory),
-        nq, hw, nullptr);  // TODO: attach box_rpb_embed mask when reference-boxes wiring lands
+        nq, hw, vision_mask);
     vision_out = linear(ctx,
         require_tensor(model, prefix_attn_qkvo(layer, "vision_cross_attn", "o_proj", "weight")),
         require_tensor(model, prefix_attn_qkvo(layer, "vision_cross_attn", "o_proj", "bias")), vision_out);
@@ -308,7 +419,8 @@ DecoderOutput InstructsamDecoder::run(
     const std::vector<int64_t> & vision_pos_shape,
     const std::vector<float> & text_mask,
     const std::vector<int64_t> & text_mask_shape,
-    const std::vector<float> & query_pos_ext
+    const std::vector<float> & query_pos_ext,
+    const std::vector<float> & initial_reference_boxes
 ) const {
     // ── Shape guards ────────────────────────────────────────────────────
     if (queries_shape.size() != 2 || queries_shape[0] != kNumQueries || queries_shape[1] != kModelDim) {
@@ -360,6 +472,40 @@ DecoderOutput InstructsamDecoder::run(
         query_pos_buf = query_pos_ext;
     }
 
+    // Compute the vision cross-attention box_rpb bias. If caller supplied
+    // initial_reference_boxes, use them for all 6 layers (approximation until
+    // per-layer box_head refinement wiring lands); otherwise no bias.
+    //
+    // Feature grid is fixed at 72×72 (kResolution=1024 / kStride=... = 72 for
+    // InstructSAM's vision backbone) so we can hardcode.
+    constexpr int32_t kFeatH = 72;
+    constexpr int32_t kFeatW = 72;
+    std::vector<float> vision_bias;
+    if (!initial_reference_boxes.empty()) {
+        if (initial_reference_boxes.size() != static_cast<size_t>(kNumQueries * 4)) {
+            throw std::runtime_error("InstructsamDecoder.run: initial_reference_boxes must be [10, 4]");
+        }
+        const std::string p = "transformer.decoder";
+        auto get_f32 = [&](const std::string & name, size_t n) {
+            std::vector<float> v(n);
+            ggml_backend_tensor_get(require_tensor(model_, name), v.data(), 0, v.size() * sizeof(float));
+            return v;
+        };
+        const auto x0w = get_f32(p + ".box_rpb_embed_x.layer1.weight", kModelDim * 2);
+        const auto x0b = get_f32(p + ".box_rpb_embed_x.layer1.bias", kModelDim);
+        const auto x1w = get_f32(p + ".box_rpb_embed_x.layer2.weight", kHeads * kModelDim);
+        const auto x1b = get_f32(p + ".box_rpb_embed_x.layer2.bias", kHeads);
+        const auto y0w = get_f32(p + ".box_rpb_embed_y.layer1.weight", kModelDim * 2);
+        const auto y0b = get_f32(p + ".box_rpb_embed_y.layer1.bias", kModelDim);
+        const auto y1w = get_f32(p + ".box_rpb_embed_y.layer2.weight", kHeads * kModelDim);
+        const auto y1b = get_f32(p + ".box_rpb_embed_y.layer2.bias", kHeads);
+        vision_bias = build_instructsam_box_rpb_bias(
+            initial_reference_boxes,
+            kNumQueries, kFeatH, kFeatW,
+            x0w, x0b, x1w, x1b,
+            y0w, y0b, y1w, y1b);
+    }
+
     DecoderOutput out;
     out.num_layers = kLayers;
     out.num_queries = kNumQueries;
@@ -394,6 +540,14 @@ DecoderOutput InstructsamDecoder::run(
         ggml_tensor * text_mask_t  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, text_seq, kNumQueries);
         ggml_tensor * vision_mem_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kModelDim, hw);
         ggml_tensor * vision_pos_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kModelDim, hw);
+        ggml_tensor * vision_mask_t = nullptr;
+        if (!vision_bias.empty()) {
+            // ggml layout is column-major; sam3cpp stores mask as
+            // [hw, num_queries, heads, 1] with row-major linear buffer
+            // matching build_instructsam_box_rpb_bias's [heads][queries][hw] order.
+            vision_mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hw, kNumQueries, kHeads, 1);
+            ggml_backend_sched_set_tensor_backend(sched, vision_mask_t, backend);
+        }
         for (ggml_tensor * t : {hidden_t, query_pos_t, text_mem_t, vision_mem_t, vision_pos_t}) {
             ggml_backend_sched_set_tensor_backend(sched, t, backend);
         }
@@ -403,7 +557,8 @@ DecoderOutput InstructsamDecoder::run(
             ctx, model_, layer,
             hidden_t, query_pos_t,
             text_mem_t, text_seq, text_mask_t,
-            vision_mem_t, vision_pos_t, hw);
+            vision_mem_t, vision_pos_t, hw,
+            vision_mask_t);
 
         ggml_tensor * capture = ggml_cont(ctx, layer_out);
         ggml_build_forward_expand(gf, capture);
@@ -421,6 +576,10 @@ DecoderOutput InstructsamDecoder::run(
             vision_memory.size() * sizeof(float));
         ggml_backend_tensor_set(vision_pos_t, vision_pos.data(), 0,
             vision_pos.size() * sizeof(float));
+        if (vision_mask_t != nullptr) {
+            ggml_backend_tensor_set(vision_mask_t, vision_bias.data(), 0,
+                vision_bias.size() * sizeof(float));
+        }
 
         const ggml_status status = ggml_backend_sched_graph_compute(sched, gf);
         if (status != GGML_STATUS_SUCCESS) {
