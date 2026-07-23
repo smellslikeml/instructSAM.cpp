@@ -180,6 +180,9 @@ endif()
 add_executable(sam3-inspect tools/sam3_inspect.cpp)
 target_link_libraries(sam3-inspect PRIVATE sam3cpp)
 
+add_executable(sam3-instructsam-sanity tools/sam3_instructsam_sanity.cpp)
+target_link_libraries(sam3-instructsam-sanity PRIVATE sam3cpp)
+
 add_executable(sam3-text-encode tools/sam3_text_encode.cpp)
 target_link_libraries(sam3-text-encode PRIVATE sam3cpp)
 
