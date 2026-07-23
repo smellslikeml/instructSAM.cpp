@@ -79,6 +79,7 @@ add_library(sam3cpp
     src/gguf_model.cpp
     src/decoder.cpp
     src/instructsam_decoder.cpp
+    src/instructsam_mask_tail.cpp
     src/encoder_fusion.cpp
     src/geometry_encoder.cpp
     src/grounding_head.cpp
@@ -113,6 +114,7 @@ add_library(sam3cpp_static STATIC
     src/gguf_model.cpp
     src/decoder.cpp
     src/instructsam_decoder.cpp
+    src/instructsam_mask_tail.cpp
     src/encoder_fusion.cpp
     src/geometry_encoder.cpp
     src/grounding_head.cpp
@@ -187,6 +189,9 @@ target_link_libraries(sam3-instructsam-sanity PRIVATE sam3cpp)
 
 add_executable(sam3-instructsam-decoder-test tools/sam3_instructsam_decoder_test.cpp)
 target_link_libraries(sam3-instructsam-decoder-test PRIVATE sam3cpp)
+
+add_executable(sam3-instructsam-mask-tail-test tools/sam3_instructsam_mask_tail_test.cpp)
+target_link_libraries(sam3-instructsam-mask-tail-test PRIVATE sam3cpp)
 
 add_executable(sam3-text-encode tools/sam3_text_encode.cpp)
 target_link_libraries(sam3-text-encode PRIVATE sam3cpp)

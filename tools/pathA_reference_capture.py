@@ -166,8 +166,31 @@ def main() -> int:
     for i, layer in enumerate(gm.detr_decoder.layers):
         hooks.hook(layer, f"detr_decoder_layer_{i}")
 
-    # Mask decoder — final output
+    # Mask decoder — final output + submodule intermediates for the ggml port
     hooks.hook(gm.mask_decoder, "mask_decoder")
+    hooks.hook(gm.mask_decoder.pixel_decoder, "mask_decoder__pixel_decoder")
+    hooks.hook(gm.mask_decoder.instance_projection, "mask_decoder__instance_projection")
+    hooks.hook(gm.mask_decoder.semantic_projection, "mask_decoder__semantic_projection")
+    hooks.hook(gm.mask_decoder.mask_embedder, "mask_decoder__mask_embedder")
+    hooks.hook(gm.mask_decoder.prompt_cross_attn, "mask_decoder__prompt_cross_attn")
+    hooks.hook(gm.mask_decoder.prompt_cross_attn_norm, "mask_decoder__prompt_cross_attn_norm")
+
+    # Vision backbone FPN features — mask_decoder's pixel_decoder consumes
+    # this list. Capture the neck's outputs (multi-scale FPN pyramid).
+    hooks.hook(gm.vision_encoder.neck, "vision_encoder__neck")
+
+    # Manually capture mask_decoder's INPUTS (kwargs) — the output-hook path
+    # only sees the final output dict; we need backbone_features + prompt
+    # inputs for the ggml port's parity harness.
+    md_inputs = {}
+    def _md_pre_hook(_mod, args, kwargs):
+        if "decoder_queries" in kwargs and "decoder_queries" not in md_inputs:
+            md_inputs["decoder_queries"]     = kwargs.get("decoder_queries")
+            md_inputs["backbone_features"]   = kwargs.get("backbone_features")
+            md_inputs["encoder_hidden_states"] = kwargs.get("encoder_hidden_states")
+            md_inputs["prompt_features"]     = kwargs.get("prompt_features")
+            md_inputs["prompt_mask"]         = kwargs.get("prompt_mask")
+    hooks._handles.append(gm.mask_decoder.register_forward_pre_hook(_md_pre_hook, with_kwargs=True))
 
     # Geometry encoder + dot-product scoring
     hooks.hook(gm.geometry_encoder, "geometry_encoder")
@@ -223,6 +246,23 @@ def main() -> int:
         safe = name.replace("::", "__").replace("/", "_")
         save_tensor(tensor, out_dir / f"{safe}.pt", name,
                     manifest["tensors"])
+
+    # Mask decoder inputs captured via pre-hook
+    if "decoder_queries" in md_inputs:
+        for k in ["decoder_queries", "encoder_hidden_states",
+                  "prompt_features", "prompt_mask"]:
+            v = md_inputs.get(k)
+            if v is not None and isinstance(v, torch.Tensor):
+                save_tensor(v, out_dir / f"mask_decoder_in__{k}.pt",
+                            f"mask_decoder_in::{k}", manifest["tensors"])
+        # backbone_features is a list of tensors — save each
+        bf = md_inputs.get("backbone_features")
+        if bf is not None:
+            for i, t in enumerate(bf):
+                if isinstance(t, torch.Tensor):
+                    save_tensor(t, out_dir / f"mask_decoder_in__backbone_features_{i}.pt",
+                                f"mask_decoder_in::backbone_features_{i}",
+                                manifest["tensors"])
 
     hooks.remove_all()
 

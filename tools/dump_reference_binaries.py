@@ -33,6 +33,13 @@ DUMPS = [
     ("detr_decoder_layer_4.pt",                  "expected_layer_4"),
     ("detr_decoder_layer_5.pt",                  "expected_layer_5"),
     ("detr_decoder__reference_boxes.pt",         "reference_boxes_all"),
+    # Mask decoder inputs + intermediates (for step 3+ mask-tail work)
+    ("mask_decoder_in__decoder_queries.pt",      "md_decoder_queries"),
+    ("mask_decoder__pixel_decoder.pt",           "md_pixel_embed"),
+    ("mask_decoder__mask_embedder.pt",           "md_mask_embeddings"),
+    ("mask_decoder__instance_projection.pt",     "md_instance_embeds"),
+    ("mask_decoder__pred_masks.pt",              "md_pred_masks"),
+    ("mask_decoder__semantic_projection.pt",     "md_semantic_seg"),
 ]
 
 

@@ -47,19 +47,71 @@ box_head and ref_point_head evaluations are tiny (10 queries × 256 dim,
 3-layer MLPs). Doing them CPU-side avoids the overhead of building a
 second graph per layer boundary.
 
-## What's still deferred (steps 3-5)
+## Mask decoder — tail (segmentation head end)
 
-- **Batch dim (4 objects)**: current test runs object 0 only. Wrapping
-  the caller to loop over 4 objects is trivial (~30 min); the decoder
-  itself is object-agnostic.
-- **dot_product_scoring**: needs to run against final decoder output
-  + phrase embeddings to produce per-slot cls_score [10] per object.
-- **mask_decoder**: takes decoder hidden_states + vision_memory + text
-  features and produces the 288×288 segmentation masks. This is the
-  actual segmentation output.
-- **CLI orchestration**: end-to-end binary that takes an image + query,
-  runs InstructSAM's LM half (from Path B's llama.cpp), then runs the
-  grounding + mask decoder via this InstructsamDecoder, outputs masks.
+**Given reference `pixel_embed` + `decoder_queries` as inputs, the mask
+tail produces `pred_masks` and `semantic_seg` at cos-sim 0.999999 vs.
+PyTorch reference (max diff 0.083, rel L2 0.16%).**
+
+`InstructsamMaskTail` (src/instructsam_mask_tail.cpp) implements:
+- `mask_embedder`: 3-layer MLP (256→256→256→256) with ReLU
+- `instance_projection`: Conv1x1 (256→256) on pixel_embed
+- `semantic_projection`: Conv1x1 (256→1) on pixel_embed
+- `pred_masks = einsum("qc,chw->qhw", mask_emb, instance_embed)`
+
+Runtime is ~8.8s CPU per object (dominated by the 5.4B-flop
+instance_projection). Trivially moveable to ggml for GPU acceleration.
+
+Reference oracle now captures 42 tensors (was 29) including all mask
+decoder inputs (backbone_features multi-scale, decoder_queries,
+encoder_hidden_states, prompt_features, prompt_mask) and intermediates
+(pixel_decoder output, mask_embedder output, instance_projection output).
+
+## What's still deferred for full E2E
+
+Two components stand between the current state and end-to-end masks
+without any Python intermediates:
+
+1. **Sam3PixelDecoder FPN** (~1-2 days C++)
+   - 3 upsampling stages: conv3x3 → GroupNorm(groups=8) → ReLU
+   - Iterate coarse → fine, interpolate (nearest) + skip + conv + norm + relu
+   - InstructSAM uses 3 stages (conv_layers.0/1/2); sam3cpp's stock
+     implementation has only 2. Fork with 3 stages.
+   - Consumes `backbone_features` list [4, 256, 288, 288],
+     [4, 256, 144, 144], [4, 256, 72, 72] — replace coarsest with
+     encoder_hidden_states reshaped.
+
+2. **prompt_cross_attn** (~4-6 hours C++)
+   - Normalize encoder_hidden_states
+   - Cross-attention (Q=normalized encoder, K=V=prompt_features,
+     mask=bidirectional_mask from prompt_mask)
+   - Add attention output back to encoder_hidden_states (residual)
+   - Uses same Sam3Attention structure as decoder cross-attn.
+
+Once both land, the flow becomes:
+```
+backbone_features → pixel_decoder → pixel_embed
+      + prompt_cross_attn(encoder, prompt)
+→ pixel_embed → mask_tail(pixel_embed, decoder_queries) → pred_masks
+```
+
+Then wrap in a batch loop (4 objects) and the segmentation half is
+complete. LM half comes from Path B's llama.cpp Qwen3-VL runtime.
+
+## Iteration ledger — full path A journey so far
+
+| Milestone | Result |
+|---|---|
+| 2d: structural decoder fork | 6 layers compile, no NaN/Inf |
+| 2e-a: query_pos wired | L0 cos-sim 0.873 |
+| 2e-b: box_rpb bias wired | L0 cos-sim 0.9996 |
+| 2e-c: per-layer box_head refinement | 6/6 layers cos-sim > 0.996 |
+| 3-tail: mask_tail (embedder + projections + einsum) | **cos-sim 0.999999** |
+
+Full E2E masks: mask_tail with reference-pixel_embed matches PyTorch to
+0.0001% cosine error — the seg-head math is correct. FPN + prompt_cross_attn
+wiring are the last remaining pieces before the whole pipeline runs without
+Python intermediates.
 
 ## How to run the dashboard
 
