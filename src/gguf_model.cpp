@@ -5,6 +5,12 @@
 #include <cstdio>
 #include <stdexcept>
 
+// mmap deps
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace sam3 {
 
 namespace {
@@ -78,20 +84,41 @@ void GgufModel::clear() {
         gguf_free(gguf_ctx_);
         gguf_ctx_ = nullptr;
     }
+    if (mmap_addr_ != nullptr) {
+        munmap(mmap_addr_, mmap_size_);
+        mmap_addr_ = nullptr;
+        mmap_size_ = 0;
+    }
 }
 
-bool GgufModel::load(const std::string & path, bool prefer_gpu, const std::string & tensor_map_path) {
+bool GgufModel::load(const std::string & path, bool prefer_gpu,
+                     const std::string & tensor_map_path, bool use_mmap) {
     clear();
 
+    // For mmap mode: don't have gguf allocate the data — we'll point tensors
+    // into the mmap'd region ourselves. no_alloc=true, ctx pointer optional
+    // (still useful to enumerate tensors' shape/dtype metadata).
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params params = {
-        /*.no_alloc =*/ false,
+        /*.no_alloc =*/ use_mmap,
         /*.ctx =*/ &tmp_ctx,
     };
     gguf_ctx_ = gguf_init_from_file(path.c_str(), params);
     if (gguf_ctx_ == nullptr || tmp_ctx == nullptr) {
         clear();
         return false;
+    }
+
+    if (use_mmap) {
+        // mmap the whole file
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) { clear(); return false; }
+        mmap_size_ = static_cast<size_t>(st.st_size);
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) { clear(); return false; }
+        mmap_addr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (mmap_addr_ == MAP_FAILED) { mmap_addr_ = nullptr; clear(); return false; }
     }
 
     weights_ctx_ = ggml_init({
@@ -105,7 +132,7 @@ bool GgufModel::load(const std::string & path, bool prefer_gpu, const std::strin
     }
 
     backend_ = nullptr;
-    if (prefer_gpu) {
+    if (!use_mmap && prefer_gpu) {
         backend_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
         if (backend_ == nullptr) {
             backend_ = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
@@ -140,16 +167,42 @@ bool GgufModel::load(const std::string & path, bool prefer_gpu, const std::strin
         tensors_.push_back(std::move(info));
     }
 
-    buffer_ = ggml_backend_alloc_ctx_tensors(weights_ctx_, backend_);
-    if (buffer_ == nullptr) {
-        clear();
-        ggml_free(tmp_ctx);
-        return false;
-    }
+    if (use_mmap) {
+        // Point each tensor's data pointer into the mmap region.
+        // GGUF layout: header ... data_offset ... [tensor0][tensor1]...
+        // Each tensor is at (data_offset + gguf_get_tensor_offset(i))
+        // relative to file start.
+        const size_t data_offset = gguf_get_data_offset(gguf_ctx_);
+        // Wrap the mmap region as a single backend buffer so ggml_backend_*
+        // APIs (like ggml_backend_tensor_get) recognise it and just memcpy.
+        buffer_ = ggml_backend_cpu_buffer_from_ptr(
+            static_cast<uint8_t *>(mmap_addr_) + data_offset,
+            mmap_size_ - data_offset);
+        if (buffer_ == nullptr) {
+            clear();
+            ggml_free(tmp_ctx);
+            return false;
+        }
+        // Assign each tensor's data pointer manually into the mmap region.
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const char * name = gguf_get_tensor_name(gguf_ctx_, i);
+            ggml_tensor * dst = ggml_get_tensor(weights_ctx_, name);
+            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx_, i);
+            dst->data = static_cast<uint8_t *>(mmap_addr_) + data_offset + tensor_offset;
+            dst->buffer = buffer_;
+        }
+    } else {
+        buffer_ = ggml_backend_alloc_ctx_tensors(weights_ctx_, backend_);
+        if (buffer_ == nullptr) {
+            clear();
+            ggml_free(tmp_ctx);
+            return false;
+        }
 
-    for (ggml_tensor * cur = ggml_get_first_tensor(weights_ctx_); cur != nullptr; cur = ggml_get_next_tensor(weights_ctx_, cur)) {
-        ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-        ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        for (ggml_tensor * cur = ggml_get_first_tensor(weights_ctx_); cur != nullptr; cur = ggml_get_next_tensor(weights_ctx_, cur)) {
+            ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
+            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        }
     }
 
     metadata_.architecture = gguf_get_string_opt(gguf_ctx_, "general.architecture");

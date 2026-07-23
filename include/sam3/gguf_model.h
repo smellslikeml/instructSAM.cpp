@@ -38,7 +38,19 @@ public:
     GgufModel(const GgufModel &) = delete;
     GgufModel & operator=(const GgufModel &) = delete;
 
-    bool load(const std::string & path, bool prefer_gpu = true, const std::string & tensor_map_path = {});
+    // Loading modes:
+    //   prefer_gpu=true, use_mmap=false (default): eager load into GPU/CPU
+    //     backend buffer — ~2x file size peak RAM (tmp_ctx + backend copy).
+    //     Fine for smaller GGUFs (grounding half, <2GB).
+    //
+    //   use_mmap=true: mmap the file, tensors point directly into the
+    //     mmap region. Ignores prefer_gpu (mmap is always CPU-side).
+    //     Peak RAM ~= file size, but only pages actually touched are
+    //     faulted in. Right for the 3.3GB LM GGUF on constrained boxes.
+    bool load(const std::string & path,
+              bool prefer_gpu = true,
+              const std::string & tensor_map_path = {},
+              bool use_mmap = false);
 
     const Metadata & metadata() const { return metadata_; }
     const std::vector<TensorInfo> & tensors() const { return tensors_; }
@@ -61,6 +73,10 @@ private:
     ggml_backend_t backend_ = nullptr;
     mutable ggml_backend_t cpu_backend_ = nullptr;
     ggml_backend_buffer_t buffer_ = nullptr;
+
+    // mmap-mode bookkeeping
+    void * mmap_addr_ = nullptr;
+    size_t mmap_size_ = 0;
 
     void clear();
 };

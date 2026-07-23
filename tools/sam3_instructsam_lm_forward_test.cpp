@@ -39,9 +39,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::cout << "loading LM GGUF (CPU backend, ~3.3GB)...\n" << std::flush;
+    std::cout << "loading LM GGUF (mmap mode, ~3.3GB file, lazy paging)...\n" << std::flush;
     sam3::GgufModel model;
-    if (!model.load(argv[1], /*prefer_gpu=*/false)) { std::cerr << "load failed\n"; return 2; }
+    if (!model.load(argv[1], /*prefer_gpu=*/false, /*tensor_map=*/{}, /*use_mmap=*/true)) {
+        std::cerr << "load failed\n";
+        return 2;
+    }
     std::cout << "loaded LM GGUF: " << model.tensors().size() << " tensors\n" << std::flush;
 
     sam3::InstructsamLmForward lm(model);
