@@ -60,6 +60,9 @@ DUMPS = [
     ("detr_encoder_layer_3.pt",                   "enc_expected_layer_3"),
     ("detr_encoder_layer_4.pt",                   "enc_expected_layer_4"),
     ("detr_encoder_layer_5.pt",                   "enc_expected_layer_5"),
+    # LM-bridge inputs + expected outputs (object-0 slice)
+    ("seg_output_embeddings.pt",                  "lmb_seg_output_embeddings"),
+    ("mask_hidden_fcs_0.pt",                      "lmb_mask_hidden_fcs_out"),
 ]
 
 

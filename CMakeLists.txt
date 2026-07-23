@@ -83,6 +83,7 @@ add_library(sam3cpp
     src/instructsam_pixel_decoder.cpp
     src/instructsam_prompt_cross_attn.cpp
     src/instructsam_detr_encoder.cpp
+    src/instructsam_lm_bridge.cpp
     src/encoder_fusion.cpp
     src/geometry_encoder.cpp
     src/grounding_head.cpp
@@ -121,6 +122,7 @@ add_library(sam3cpp_static STATIC
     src/instructsam_pixel_decoder.cpp
     src/instructsam_prompt_cross_attn.cpp
     src/instructsam_detr_encoder.cpp
+    src/instructsam_lm_bridge.cpp
     src/encoder_fusion.cpp
     src/geometry_encoder.cpp
     src/grounding_head.cpp
@@ -213,6 +215,9 @@ target_link_libraries(sam3-instructsam-full-e2e PRIVATE sam3cpp)
 
 add_executable(sam3-instructsam-batch-e2e tools/sam3_instructsam_batch_e2e.cpp)
 target_link_libraries(sam3-instructsam-batch-e2e PRIVATE sam3cpp)
+
+add_executable(sam3-instructsam-lm-bridge-test tools/sam3_instructsam_lm_bridge_test.cpp)
+target_link_libraries(sam3-instructsam-lm-bridge-test PRIVATE sam3cpp)
 
 add_executable(sam3-text-encode tools/sam3_text_encode.cpp)
 target_link_libraries(sam3-text-encode PRIVATE sam3cpp)
