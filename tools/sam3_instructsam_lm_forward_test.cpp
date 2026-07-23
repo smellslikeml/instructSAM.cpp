@@ -140,6 +140,57 @@ int main(int argc, char ** argv) {
     } else {
         std::cout << "  ✗ " << nan_count << " NaN/Inf values — investigate\n";
     }
-    std::cout << "  Next: parity vs. PyTorch InstructSAM reference (needs LM layer hooks in capture harness)\n";
+
+    // ── Milestone 5: parity vs llama.cpp reference ─────────────────────
+    std::cout << "\n=== parity vs. llama.cpp reference (same 4-token sequence) ===\n";
+    try {
+        std::vector<int64_t> ref_s;
+        const auto ref_hidden = read_bin_f32("/tmp/pathA_reference/lm_ref_final_hidden.f32", ref_s);
+        if (ref_hidden.size() != final_hidden.size()) {
+            std::cout << "  ✗ size mismatch: ours=" << final_hidden.size() << " ref=" << ref_hidden.size() << "\n";
+        } else {
+            auto cos = [&](const float * a, const float * b, size_t n) {
+                double dot = 0.0, na = 0.0, nb = 0.0;
+                for (size_t k = 0; k < n; ++k) {
+                    dot += static_cast<double>(a[k]) * b[k];
+                    na  += static_cast<double>(a[k]) * a[k];
+                    nb  += static_cast<double>(b[k]) * b[k];
+                }
+                return dot / (std::sqrt(na) * std::sqrt(nb));
+            };
+            double all_maxd = 0.0, all_l2d = 0.0, all_l2r = 0.0;
+            for (size_t i = 0; i < final_hidden.size(); ++i) {
+                const double d = final_hidden[i] - ref_hidden[i];
+                if (std::fabs(d) > all_maxd) all_maxd = std::fabs(d);
+                all_l2d += d * d;
+                all_l2r += static_cast<double>(ref_hidden[i]) * ref_hidden[i];
+            }
+            std::cout << "  Per-position parity:\n";
+            std::cout << "    pos  |  cos_sim  |  max_diff |  rel_L2\n";
+            std::cout << "    -----+-----------+-----------+---------\n";
+            for (size_t i = 0; i < tok_ids.size(); ++i) {
+                const float * ours = final_hidden.data() + i * 2048;
+                const float * ref  = ref_hidden.data()   + i * 2048;
+                const double c = cos(ours, ref, 2048);
+                double mx = 0.0, l2d = 0.0, l2r = 0.0;
+                for (int k = 0; k < 2048; ++k) {
+                    const double d = ours[k] - ref[k];
+                    if (std::fabs(d) > mx) mx = std::fabs(d);
+                    l2d += d * d; l2r += static_cast<double>(ref[k]) * ref[k];
+                }
+                std::cout << "    " << i << "    | " << c << " | " << mx << " | "
+                          << (std::sqrt(l2d) / std::sqrt(l2r)) << "\n";
+            }
+            std::cout << "\n  Aggregate:\n";
+            std::cout << "    cos_sim (flat) : " << cos(final_hidden.data(), ref_hidden.data(), final_hidden.size()) << "\n";
+            std::cout << "    max_diff       : " << all_maxd << "\n";
+            std::cout << "    rel_L2         : " << (std::sqrt(all_l2d) / std::sqrt(all_l2r)) << "\n";
+        }
+    } catch (const std::exception & e) {
+        std::cout << "  (no reference dump found: " << e.what() << ")\n";
+        std::cout << "  Run instructsam-lm-reference-dump first.\n";
+    }
+
+    std::cout << "\n=== Qwen3 fork Day 5: parity checked vs llama.cpp ===\n";
     return 0;
 }
