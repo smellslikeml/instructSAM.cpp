@@ -62,6 +62,13 @@ public:
         const std::vector<int64_t> & pixel_shape
     ) const;
 
+    // Run ONE encoder layer starting from spatial [72*72, 1024] hidden states.
+    // Handles windowed attention (24×24) with 2D axial RoPE for layers not
+    // in {7, 15, 23, 31}, or global attention (72×72 with scale=1/3) for those.
+    // Structure per Sam3ViTLayer.forward: LN1 → windowed attn (with 2D RoPE
+    // on Q and K) → residual → LN2 → MLP (GELU) → residual.
+    std::vector<float> run_layer(int layer_idx, const std::vector<float> & hidden) const;
+
     // Full 32-layer forward pass. TODO after layer 0 lands.
     // std::vector<float> run(...) const;
 

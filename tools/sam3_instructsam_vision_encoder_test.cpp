@@ -7,6 +7,7 @@
 #include "sam3/gguf_model.h"
 #include "sam3/instructsam_vision_encoder.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -129,6 +130,45 @@ int main(int argc, char ** argv) {
               << "    max abs diff      : " << maxdiff << "\n"
               << "    relative L2 error : " << (std::sqrt(l2diff) / std::sqrt(l2ref)) << "\n";
 
-    std::cout << "\n=== next milestone: layer 0 forward (windowed 2D-RoPE attn) ===\n";
+    // ── Milestone 3: layer 0 forward parity ─────────────────────────────
+    std::cout << "\n=== milestone 3: layer 0 forward parity ===\n";
+    {
+        std::vector<int64_t> l0s;
+        std::vector<float> ref_l0;
+        try {
+            ref_l0 = read_bin_f32(dir + "/layer_00.f32", l0s);
+        } catch (const std::exception & e) {
+            std::cerr << "  ✗ layer_00.f32 missing: " << e.what() << "\n";
+            return 5;
+        }
+        std::cout << "  ref layer_00 shape=[";
+        for (size_t i = 0; i < l0s.size(); ++i) std::cout << (i?",":"") << l0s[i];
+        std::cout << "]\n" << std::flush;
+
+        std::cout << "  running layer 0 (CPU, ~30-60s for the 5.4B-flop MLP)...\n" << std::flush;
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto layer0_out = enc.run_layer(0, ours);
+        const auto t1 = std::chrono::steady_clock::now();
+        std::cout << "  runtime: " << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count() << " ms\n";
+
+        if (layer0_out.size() != ref_l0.size()) {
+            std::cerr << "  ✗ size mismatch: ours=" << layer0_out.size() << " ref=" << ref_l0.size() << "\n";
+            return 6;
+        }
+        double maxd = 0.0, l2d = 0.0, l2r = 0.0;
+        for (size_t i = 0; i < layer0_out.size(); ++i) {
+            const double d = static_cast<double>(layer0_out[i]) - ref_l0[i];
+            if (std::fabs(d) > maxd) maxd = std::fabs(d);
+            l2d += d * d; l2r += static_cast<double>(ref_l0[i]) * ref_l0[i];
+        }
+        std::cout << "\n  layer 0 parity:\n"
+                  << "    cos_sim  : " << cos_flat(layer0_out, ref_l0) << "\n"
+                  << "    max_diff : " << maxd << "\n"
+                  << "    rel_L2   : " << std::sqrt(l2d) / std::sqrt(l2r) << "\n"
+                  << "    ours[0..3]: " << layer0_out[0] << " " << layer0_out[1] << " " << layer0_out[2] << " " << layer0_out[3] << "\n"
+                  << "    ref[0..3] : " << ref_l0[0]     << " " << ref_l0[1]     << " " << ref_l0[2]     << " " << ref_l0[3]     << "\n";
+    }
+
+    std::cout << "\n=== next milestone: layers 1-31 (mostly a loop) ===\n";
     return 0;
 }

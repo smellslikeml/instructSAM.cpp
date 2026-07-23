@@ -27,6 +27,8 @@ constexpr int32_t kNumPatches   = kGridSize * kGridSize;    // 5184
 constexpr int32_t kWindowSize   = 24;
 constexpr float   kLayerNormEps = 1e-6f;
 constexpr int32_t kPretrainGrid = 24;   // 336px / 14 patch = 24; stored pos_embed is [1, 576, 1024]
+constexpr float   kRopeTheta    = 10000.0f;
+constexpr int32_t kMlpDim       = kIntermediate;  // 4736
 
 const std::string kBase = "backbone.vision_backbone.trunk";
 
@@ -124,6 +126,148 @@ std::vector<std::string> per_layer_tensor_names(int layer) {
         names.push_back(p + ".mlp." + fc + ".bias");
     }
     return names;
+}
+
+// ── 2D axial RoPE table (per-window, so 24×24 = 576 positions) ─────────
+// Matches Sam3ViTRotaryEmbedding: freqs = 1/(theta^(arange(0,dim,4)/dim)) [16],
+// concat freqs_x + freqs_y along feature dim → [576, 32], then
+// repeat_interleave 2 → [576, 64]. cos/sin.
+struct RopeTable {
+    int64_t seq_len;                // 576 for window 24×24
+    int64_t head_dim;               // 64
+    std::vector<float> cos_tab;     // [seq_len, head_dim]
+    std::vector<float> sin_tab;     // [seq_len, head_dim]
+};
+
+RopeTable build_rope_table_2d(int64_t grid_x, int64_t grid_y, float scale) {
+    RopeTable t;
+    t.head_dim = kHeadDim;
+    t.seq_len  = grid_x * grid_y;
+    // freqs [dim/4 = 16]
+    const int64_t nfreqs = kHeadDim / 4;
+    std::vector<float> freqs(static_cast<size_t>(nfreqs));
+    for (int64_t i = 0; i < nfreqs; ++i) {
+        // arange(0, dim, 4) → [0, 4, 8, ..., 60], divide by dim=64
+        freqs[static_cast<size_t>(i)] = 1.0f / std::pow(kRopeTheta,
+            static_cast<float>(4 * i) / static_cast<float>(kHeadDim));
+    }
+    t.cos_tab.assign(static_cast<size_t>(t.seq_len * t.head_dim), 0.0f);
+    t.sin_tab.assign(static_cast<size_t>(t.seq_len * t.head_dim), 0.0f);
+
+    for (int64_t seq = 0; seq < t.seq_len; ++seq) {
+        const int64_t x = (seq % grid_x);
+        const int64_t y = (seq / grid_x);
+        const float xp = static_cast<float>(x) * scale;
+        const float yp = static_cast<float>(y) * scale;
+        // Match PyTorch: inv_freq = cat([outer(x_pos, freqs), outer(y_pos, freqs)])
+        //                inv_freq = repeat_interleave(2, dim=-1)
+        // So dim k in [0, 32): freq index k/2 with x_pos.
+        //    dim k in [32, 64): freq index (k-32)/2 with y_pos.
+        for (int64_t k = 0; k < kHeadDim / 2; ++k) {
+            const float angle = xp * freqs[static_cast<size_t>(k / 2)];
+            t.cos_tab[static_cast<size_t>(seq * kHeadDim + k)] = std::cos(angle);
+            t.sin_tab[static_cast<size_t>(seq * kHeadDim + k)] = std::sin(angle);
+        }
+        for (int64_t k = kHeadDim / 2; k < kHeadDim; ++k) {
+            const float angle = yp * freqs[static_cast<size_t>((k - kHeadDim / 2) / 2)];
+            t.cos_tab[static_cast<size_t>(seq * kHeadDim + k)] = std::cos(angle);
+            t.sin_tab[static_cast<size_t>(seq * kHeadDim + k)] = std::sin(angle);
+        }
+    }
+    return t;
+}
+
+// Apply 2D axial RoPE to a Q or K tensor of shape [B, num_heads, seq, head_dim],
+// stored row-major. rotate_pairwise: adjacent pairs (2k, 2k+1) rotate.
+//
+//   out[..., 2k]   = q[..., 2k]   * cos[..., 2k]   - q[..., 2k+1] * sin[..., 2k]
+//   out[..., 2k+1] = q[..., 2k+1] * cos[..., 2k+1] + q[..., 2k]   * sin[..., 2k+1]
+void apply_rope_2d_cpu(
+    std::vector<float> & qk,   // [B, num_heads, seq, head_dim]
+    int64_t B, int64_t H, int64_t S, int64_t D,
+    const RopeTable & tab
+) {
+    if (D != tab.head_dim || S != tab.seq_len) {
+        throw std::runtime_error("apply_rope_2d_cpu: shape mismatch");
+    }
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t h = 0; h < H; ++h) {
+            for (int64_t s = 0; s < S; ++s) {
+                float * row = qk.data() + ((b * H + h) * S + s) * D;
+                const float * c = tab.cos_tab.data() + s * D;
+                const float * si = tab.sin_tab.data() + s * D;
+                for (int64_t k = 0; k < D; k += 2) {
+                    const float x0 = row[k];
+                    const float x1 = row[k + 1];
+                    row[k]     = x0 * c[k]     - x1 * si[k];
+                    row[k + 1] = x1 * c[k + 1] + x0 * si[k + 1];
+                }
+            }
+        }
+    }
+}
+
+// Window partition: input [C, seq=W*H, 1] (with hidden fastest, spatial in
+// row-major (h, w) order). Rearranges to [C, win*win, num_windows*B].
+// For W=H=72, win=24: produces 9 windows per batch.
+std::vector<float> cpu_window_partition(
+    const std::vector<float> & spatial,   // [C, W*H, 1] flat, iterating (h, w, c) c fastest
+    int64_t W, int64_t H, int64_t win
+) {
+    const int64_t nWx = W / win;
+    const int64_t nWy = H / win;
+    const int64_t num_windows = nWx * nWy;
+    std::vector<float> out(spatial.size());
+    for (int64_t wy = 0; wy < nWy; ++wy) {
+        for (int64_t wx = 0; wx < nWx; ++wx) {
+            const int64_t window_idx = wy * nWx + wx;
+            for (int64_t iy = 0; iy < win; ++iy) {
+                for (int64_t ix = 0; ix < win; ++ix) {
+                    const int64_t src_h = wy * win + iy;
+                    const int64_t src_w = wx * win + ix;
+                    const int64_t src_seq = src_h * W + src_w;
+                    const int64_t dst_seq = iy * win + ix;
+                    // C is fastest — copy C values contiguously
+                    const size_t src_off = static_cast<size_t>(src_seq) * kHiddenSize;
+                    const size_t dst_off = static_cast<size_t>(
+                        window_idx * win * win + dst_seq) * kHiddenSize;
+                    std::memcpy(out.data() + dst_off, spatial.data() + src_off,
+                                kHiddenSize * sizeof(float));
+                }
+            }
+        }
+    }
+    (void)num_windows;
+    return out;
+}
+
+// Inverse of window_partition.
+std::vector<float> cpu_window_unpartition(
+    const std::vector<float> & windowed,   // [C, win*win, num_windows] flat
+    int64_t W, int64_t H, int64_t win
+) {
+    const int64_t nWx = W / win;
+    const int64_t nWy = H / win;
+    std::vector<float> out(windowed.size());
+    for (int64_t wy = 0; wy < nWy; ++wy) {
+        for (int64_t wx = 0; wx < nWx; ++wx) {
+            const int64_t window_idx = wy * nWx + wx;
+            for (int64_t iy = 0; iy < win; ++iy) {
+                for (int64_t ix = 0; ix < win; ++ix) {
+                    const int64_t dst_h = wy * win + iy;
+                    const int64_t dst_w = wx * win + ix;
+                    const int64_t dst_seq = dst_h * W + dst_w;
+                    const int64_t src_seq = iy * win + ix;
+                    const size_t src_off = static_cast<size_t>(
+                        window_idx * win * win + src_seq) * kHiddenSize;
+                    const size_t dst_off = static_cast<size_t>(dst_seq) * kHiddenSize;
+                    std::memcpy(out.data() + dst_off, windowed.data() + src_off,
+                                kHiddenSize * sizeof(float));
+                }
+            }
+        }
+    }
+    return out;
 }
 
 std::vector<std::string> trunk_top_tensor_names() {
@@ -324,6 +468,186 @@ std::vector<float> InstructsamVisionEncoder::run_prenorm(
     ggml_backend_sched_free(sched);
     ggml_free(ctx);
     return result;
+}
+
+std::vector<float> InstructsamVisionEncoder::run_layer(
+    int layer_idx, const std::vector<float> & hidden_in
+) const {
+    if (hidden_in.size() != static_cast<size_t>(kNumPatches * kHiddenSize)) {
+        throw std::runtime_error("run_layer: expected [72*72, 1024] input");
+    }
+    const std::string p = layer_prefix(layer_idx);
+    const bool global = is_global_layer(layer_idx);
+
+    auto get_f32 = [&](const std::string & name, size_t n) {
+        ggml_tensor * t = require_tensor(model_, name);
+        std::vector<float> v(n);
+        if (t->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        } else if (t->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(ggml_fp16_t));
+            for (size_t i = 0; i < n; ++i) v[i] = ggml_fp16_to_fp32(buf[i]);
+        } else throw std::runtime_error("run_layer: unsupported dtype");
+        return v;
+    };
+
+    const auto ln1_w = get_f32(p + ".layer_norm1.weight", kHiddenSize);
+    const auto ln1_b = get_f32(p + ".layer_norm1.bias",   kHiddenSize);
+    const auto ln2_w = get_f32(p + ".layer_norm2.weight", kHiddenSize);
+    const auto ln2_b = get_f32(p + ".layer_norm2.bias",   kHiddenSize);
+
+    const std::vector<float> residual1 = hidden_in;
+
+    auto cpu_ln = [&](const std::vector<float> & x, int64_t N, int64_t D,
+                      const std::vector<float> & w, const std::vector<float> & b) {
+        std::vector<float> out(x.size());
+        for (int64_t i = 0; i < N; ++i) {
+            double mean = 0.0, var = 0.0;
+            for (int64_t d = 0; d < D; ++d) mean += x[static_cast<size_t>(i * D + d)];
+            mean /= D;
+            for (int64_t d = 0; d < D; ++d) {
+                const double diff = x[static_cast<size_t>(i * D + d)] - mean;
+                var += diff * diff;
+            }
+            var /= D;
+            const double inv_std = 1.0 / std::sqrt(var + kLayerNormEps);
+            for (int64_t d = 0; d < D; ++d) {
+                const double normed = (x[static_cast<size_t>(i * D + d)] - mean) * inv_std;
+                out[static_cast<size_t>(i * D + d)] = static_cast<float>(
+                    normed * w[static_cast<size_t>(d)] + b[static_cast<size_t>(d)]);
+            }
+        }
+        return out;
+    };
+    const std::vector<float> ln1_out = cpu_ln(hidden_in, kNumPatches, kHiddenSize, ln1_w, ln1_b);
+
+    const int64_t win = global ? kGridSize : kWindowSize;
+    const int64_t nW = global ? 1 : (kGridSize / kWindowSize);
+    const int64_t num_windows = nW * nW;
+    const int64_t seq_per_win = win * win;
+    std::vector<float> windowed = global
+        ? ln1_out
+        : cpu_window_partition(ln1_out, kGridSize, kGridSize, win);
+
+    const auto qw = get_f32(p + ".attention.q_proj.weight", kHiddenSize * kHiddenSize);
+    const auto qb = get_f32(p + ".attention.q_proj.bias",   kHiddenSize);
+    const auto kw = get_f32(p + ".attention.k_proj.weight", kHiddenSize * kHiddenSize);
+    const auto kb = get_f32(p + ".attention.k_proj.bias",   kHiddenSize);
+    const auto vw = get_f32(p + ".attention.v_proj.weight", kHiddenSize * kHiddenSize);
+    const auto vb = get_f32(p + ".attention.v_proj.bias",   kHiddenSize);
+    const auto ow = get_f32(p + ".attention.o_proj.weight", kHiddenSize * kHiddenSize);
+    const auto ob = get_f32(p + ".attention.o_proj.bias",   kHiddenSize);
+
+    auto cpu_linear = [](const std::vector<float> & x, int64_t N,
+                         int64_t D_in, int64_t D_out,
+                         const std::vector<float> & w,
+                         const std::vector<float> & b) {
+        std::vector<float> y(static_cast<size_t>(N * D_out));
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t o = 0; o < D_out; ++o) {
+                float s = b[static_cast<size_t>(o)];
+                for (int64_t k = 0; k < D_in; ++k) {
+                    s += w[static_cast<size_t>(o * D_in + k)] *
+                         x[static_cast<size_t>(n * D_in + k)];
+                }
+                y[static_cast<size_t>(n * D_out + o)] = s;
+            }
+        }
+        return y;
+    };
+
+    const int64_t total_tokens = num_windows * seq_per_win;
+    auto Q = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, qw, qb);
+    auto K = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, kw, kb);
+    auto V = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, vw, vb);
+
+    // Transpose to [num_windows, num_heads, seq_per_win, head_dim] for RoPE + attention
+    auto to_heads = [&](const std::vector<float> & flat) {
+        std::vector<float> out(flat.size());
+        for (int64_t b = 0; b < num_windows; ++b) {
+            for (int64_t h = 0; h < kNumHeads; ++h) {
+                for (int64_t s = 0; s < seq_per_win; ++s) {
+                    for (int64_t d = 0; d < kHeadDim; ++d) {
+                        const size_t src = ((b * seq_per_win + s) * kNumHeads + h) * kHeadDim + d;
+                        const size_t dst = ((b * kNumHeads + h) * seq_per_win + s) * kHeadDim + d;
+                        out[dst] = flat[src];
+                    }
+                }
+            }
+        }
+        return out;
+    };
+    Q = to_heads(Q); K = to_heads(K); V = to_heads(V);
+
+    const float rope_scale = global ? (static_cast<float>(kWindowSize) / kGridSize) : 1.0f;
+    const RopeTable rope = build_rope_table_2d(win, win, rope_scale);
+    apply_rope_2d_cpu(Q, num_windows, kNumHeads, seq_per_win, kHeadDim, rope);
+    apply_rope_2d_cpu(K, num_windows, kNumHeads, seq_per_win, kHeadDim, rope);
+
+    // Scaled dot-product attention CPU-side (small compute — batched over windows/heads).
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    std::vector<float> attn(static_cast<size_t>(total_tokens * kHiddenSize));
+    for (int64_t b = 0; b < num_windows; ++b) {
+        for (int64_t h = 0; h < kNumHeads; ++h) {
+            const float * qh = Q.data() + ((b * kNumHeads + h) * seq_per_win) * kHeadDim;
+            const float * kh = K.data() + ((b * kNumHeads + h) * seq_per_win) * kHeadDim;
+            const float * vh = V.data() + ((b * kNumHeads + h) * seq_per_win) * kHeadDim;
+            std::vector<float> S(static_cast<size_t>(seq_per_win * seq_per_win));
+            for (int64_t i = 0; i < seq_per_win; ++i) {
+                for (int64_t j = 0; j < seq_per_win; ++j) {
+                    float s = 0.0f;
+                    for (int64_t d = 0; d < kHeadDim; ++d) {
+                        s += qh[i * kHeadDim + d] * kh[j * kHeadDim + d];
+                    }
+                    S[static_cast<size_t>(i * seq_per_win + j)] = s * scale;
+                }
+            }
+            for (int64_t i = 0; i < seq_per_win; ++i) {
+                float * row = S.data() + i * seq_per_win;
+                float m = row[0];
+                for (int64_t j = 1; j < seq_per_win; ++j) if (row[j] > m) m = row[j];
+                float sum = 0.0f;
+                for (int64_t j = 0; j < seq_per_win; ++j) { row[j] = std::exp(row[j] - m); sum += row[j]; }
+                for (int64_t j = 0; j < seq_per_win; ++j) row[j] /= sum;
+            }
+            for (int64_t i = 0; i < seq_per_win; ++i) {
+                for (int64_t d = 0; d < kHeadDim; ++d) {
+                    float y = 0.0f;
+                    for (int64_t j = 0; j < seq_per_win; ++j) {
+                        y += S[static_cast<size_t>(i * seq_per_win + j)] * vh[j * kHeadDim + d];
+                    }
+                    const size_t out_off = ((b * seq_per_win + i) * kNumHeads + h) * kHeadDim + d;
+                    attn[out_off] = y;
+                }
+            }
+        }
+    }
+
+    auto attn_proj = cpu_linear(attn, total_tokens, kHiddenSize, kHiddenSize, ow, ob);
+
+    std::vector<float> attn_unwin = global
+        ? std::move(attn_proj)
+        : cpu_window_unpartition(attn_proj, kGridSize, kGridSize, win);
+
+    for (size_t i = 0; i < attn_unwin.size(); ++i) attn_unwin[i] += residual1[i];
+    const std::vector<float> residual2 = attn_unwin;
+
+    const std::vector<float> ln2_out = cpu_ln(attn_unwin, kNumPatches, kHiddenSize, ln2_w, ln2_b);
+
+    const auto fc1_w = get_f32(p + ".mlp.fc1.weight", kMlpDim * kHiddenSize);
+    const auto fc1_b = get_f32(p + ".mlp.fc1.bias",   kMlpDim);
+    const auto fc2_w = get_f32(p + ".mlp.fc2.weight", kHiddenSize * kMlpDim);
+    const auto fc2_b = get_f32(p + ".mlp.fc2.bias",   kHiddenSize);
+
+    auto mlp_mid = cpu_linear(ln2_out, kNumPatches, kHiddenSize, kMlpDim, fc1_w, fc1_b);
+    for (float & x : mlp_mid) {
+        x = 0.5f * x * (1.0f + std::erf(x / std::sqrt(2.0f)));
+    }
+    auto mlp_out = cpu_linear(mlp_mid, kNumPatches, kMlpDim, kHiddenSize, fc2_w, fc2_b);
+
+    for (size_t i = 0; i < mlp_out.size(); ++i) mlp_out[i] += residual2[i];
+    return mlp_out;
 }
 
 }  // namespace sam3
