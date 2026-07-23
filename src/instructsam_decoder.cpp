@@ -307,7 +307,8 @@ DecoderOutput InstructsamDecoder::run(
     const std::vector<float> & vision_pos,
     const std::vector<int64_t> & vision_pos_shape,
     const std::vector<float> & text_mask,
-    const std::vector<int64_t> & text_mask_shape
+    const std::vector<int64_t> & text_mask_shape,
+    const std::vector<float> & query_pos_ext
 ) const {
     // ── Shape guards ────────────────────────────────────────────────────
     if (queries_shape.size() != 2 || queries_shape[0] != kNumQueries || queries_shape[1] != kModelDim) {
@@ -346,10 +347,18 @@ DecoderOutput InstructsamDecoder::run(
 
     // Working buffer for the queries — updated layer-by-layer
     std::vector<float> current_hidden = queries;
-    // Placeholder for query_pos — TODO: compute from reference_points + ref_point_head MLP.
-    // For structural compile, using zeros (means queries don't get position-augmented).
-    // Numerical correctness will require proper query_pos computation in step 2e.
-    std::vector<float> query_pos_zeros(static_cast<size_t>(kNumQueries * kModelDim), 0.0f);
+    // Query positional embedding — if caller supplied one, use it (real layer-0
+    // pos from ref_point_head(sinusoidal(reference_points))). Otherwise zeros
+    // (structural smoke only, not numerically meaningful).
+    std::vector<float> query_pos_buf;
+    if (query_pos_ext.empty()) {
+        query_pos_buf.assign(static_cast<size_t>(kNumQueries * kModelDim), 0.0f);
+    } else {
+        if (query_pos_ext.size() != static_cast<size_t>(kNumQueries * kModelDim)) {
+            throw std::runtime_error("InstructsamDecoder.run: query_pos must be [10, 256]");
+        }
+        query_pos_buf = query_pos_ext;
+    }
 
     DecoderOutput out;
     out.num_layers = kLayers;
@@ -402,8 +411,8 @@ DecoderOutput InstructsamDecoder::run(
 
         ggml_backend_tensor_set(hidden_t, current_hidden.data(), 0,
             current_hidden.size() * sizeof(float));
-        ggml_backend_tensor_set(query_pos_t, query_pos_zeros.data(), 0,
-            query_pos_zeros.size() * sizeof(float));
+        ggml_backend_tensor_set(query_pos_t, query_pos_buf.data(), 0,
+            query_pos_buf.size() * sizeof(float));
         ggml_backend_tensor_set(text_mem_t, text_memory.data(), 0,
             text_memory.size() * sizeof(float));
         ggml_backend_tensor_set(text_mask_t, text_mask_f16.data(), 0,

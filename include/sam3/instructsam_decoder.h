@@ -50,6 +50,12 @@ public:
     // Returns per-layer hidden states + reference boxes. Presence-token
     // machinery is omitted (InstructSAM uses per-slot cls_score from
     // dot_product_scoring downstream, not presence prediction here).
+    // query_pos: if non-empty, [num_queries, 256] positional embedding added
+    // to Q in every attention block of every layer. Real InstructSAM updates
+    // query_pos each layer from the layer-N reference_points via ref_point_head;
+    // for now this test harness accepts an externally-computed layer-0
+    // query_pos and reuses it — good enough for layer-0 numerical parity.
+    // Pass empty vector to disable (uses zeros — for structural smoke only).
     DecoderOutput run(
         const std::vector<float> & queries,
         const std::vector<int64_t> & queries_shape,
@@ -60,7 +66,8 @@ public:
         const std::vector<float> & vision_pos,
         const std::vector<int64_t> & vision_pos_shape,
         const std::vector<float> & text_mask,
-        const std::vector<int64_t> & text_mask_shape
+        const std::vector<int64_t> & text_mask_shape,
+        const std::vector<float> & query_pos = {}
     ) const;
 
 private:
