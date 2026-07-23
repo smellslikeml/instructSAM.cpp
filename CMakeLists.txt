@@ -232,6 +232,36 @@ target_link_libraries(sam3-instructsam-vision-neck-test PRIVATE sam3cpp)
 add_executable(sam3-instructsam-vision-native-e2e tools/sam3_instructsam_vision_native_e2e.cpp)
 target_link_libraries(sam3-instructsam-vision-native-e2e PRIVATE sam3cpp)
 
+# ── Piece 3: LM integration via llama.cpp ────────────────────────────────
+# Links against Path B's pre-built llama.cpp (in scratchpad/llama.cpp/build).
+# Only enabled if the build directory exists.
+set(LLAMA_CPP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp"
+    CACHE PATH "Path B llama.cpp checkout root")
+if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
+    message(STATUS "Found llama.cpp at ${LLAMA_CPP_ROOT} — enabling Piece 3 targets")
+
+    add_executable(sam3-instructsam-llama-probe tools/sam3_instructsam_llama_probe.cpp)
+    target_include_directories(sam3-instructsam-llama-probe PRIVATE
+        "${LLAMA_CPP_ROOT}/include"
+        "${LLAMA_CPP_ROOT}/ggml/include")
+    find_package(Threads REQUIRED)
+    find_package(OpenMP REQUIRED)
+    # ggml-cpu contains backend init code that would be dropped without a
+    # direct reference — force-link via --whole-archive.
+    target_link_libraries(sam3-instructsam-llama-probe PRIVATE
+        "${LLAMA_CPP_ROOT}/build/src/libllama.a"
+        "-Wl,--whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-cpu.a"
+        "-Wl,--no-whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml.a"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-base.a"
+        Threads::Threads
+        OpenMP::OpenMP_CXX
+        m dl)
+else()
+    message(STATUS "llama.cpp build not found at ${LLAMA_CPP_ROOT}/build — skipping Piece 3 targets")
+endif()
+
 add_executable(sam3-text-encode tools/sam3_text_encode.cpp)
 target_link_libraries(sam3-text-encode PRIVATE sam3cpp)
 
