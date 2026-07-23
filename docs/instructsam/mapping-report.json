@@ -1,0 +1,65 @@
+{
+  "input": "/home/thorax/.cache/huggingface/hub/models--CircleRadon--InstructSAM-2B/snapshots/238da6833641dbc63264db46a03899be3e7c9465/model.safetensors",
+  "totals": {
+    "input_tensors": 1704,
+    "mapped": 1079,
+    "skipped_qwen3vl": 625,
+    "unmapped": 0
+  },
+  "mapped_by_component": {
+    "transformer": 394,
+    "dot_prod_scoring": 10,
+    "geometry_encoder": 94,
+    "segmentation_head": 32,
+    "text_projection": 2,
+    "backbone": 538,
+    "instructsam": 9
+  },
+  "unmapped_tensor_names": [],
+  "mapping_table": [
+    [
+      "model.grounding_model.model.vision_encoder.neck",
+      "backbone.vision_backbone.convs"
+    ],
+    [
+      "model.grounding_model.model.vision_encoder.backbone",
+      "backbone.vision_backbone.trunk"
+    ],
+    [
+      "model.grounding_model.model.detr_encoder",
+      "transformer.encoder"
+    ],
+    [
+      "model.grounding_model.model.detr_decoder",
+      "transformer.decoder"
+    ],
+    [
+      "model.grounding_model.model.mask_decoder",
+      "segmentation_head"
+    ],
+    [
+      "model.grounding_model.model.dot_product_scoring",
+      "dot_prod_scoring"
+    ],
+    [
+      "model.grounding_model.model.geometry_encoder",
+      "geometry_encoder"
+    ],
+    [
+      "model.grounding_model.model.text_projection",
+      "text_projection"
+    ],
+    [
+      "model.mask_hidden_fcs",
+      "instructsam.mask_hidden_fcs"
+    ],
+    [
+      "model.text_hidden_fcs",
+      "instructsam.text_hidden_fcs"
+    ],
+    [
+      "model.mask_queries",
+      "instructsam.mask_queries"
+    ]
+  ]
+}
