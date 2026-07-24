@@ -115,6 +115,118 @@ std::vector<float> cpu_layer_norm(
 // Very simple PNG writer via stb_image_write (vendored alongside stb_image.h).
 // For --output PNGs. Skipped if stb_image_write not vendored.
 
+// ── Detr-side constants that only depend on the grounding GGUF + image
+// spatial shape (not on the per-image LM output). Previously loaded from
+// per-object ref captures; now computed natively. ────────────────────────
+
+// Sam3SinePositionEmbedding.forward for a mask-free HxW grid, hidden_dim=256.
+// Returns [H*W, hidden_dim] flat (row-major over spatial), matching the
+// enc_vision_pos_flat.f32 captures.
+std::vector<float> compute_vision_pos_2d_sincos(
+    int64_t H, int64_t W, int64_t hidden_dim,
+    float temperature = 10000.0f, float scale = 2.0f * static_cast<float>(M_PI),
+    float eps = 1e-6f
+) {
+    const int64_t num_pos_feats = hidden_dim / 2;
+    std::vector<float> dim_t(static_cast<size_t>(num_pos_feats));
+    for (int64_t i = 0; i < num_pos_feats; ++i) {
+        const float exponent = 2.0f * std::floor(static_cast<float>(i) / 2.0f) /
+                                static_cast<float>(num_pos_feats);
+        dim_t[static_cast<size_t>(i)] = std::pow(temperature, exponent);
+    }
+    // y_embed / x_embed come from cumsum on unmasked positions → normalized
+    // by row/col total → scaled to 2π.
+    //   y_embed[i, j] = (i + 1) / H * 2π
+    //   x_embed[i, j] = (j + 1) / W * 2π
+    // pos_y and pos_x each land at [H*W, num_pos_feats] via sin/cos interleave;
+    // final flat layout is [H*W, 2*num_pos_feats] with pos_y first (see the
+    // PyTorch cat((pos_y, pos_x), dim=3) order).
+    std::vector<float> out(static_cast<size_t>(H * W * hidden_dim));
+    for (int64_t i = 0; i < H; ++i) {
+        const float y_pos = static_cast<float>(i + 1) / (static_cast<float>(H) + eps) * scale;
+        for (int64_t j = 0; j < W; ++j) {
+            const float x_pos = static_cast<float>(j + 1) / (static_cast<float>(W) + eps) * scale;
+            float * row = out.data() + (i * W + j) * hidden_dim;
+            for (int64_t k = 0; k < num_pos_feats; ++k) {
+                const float vy = y_pos / dim_t[static_cast<size_t>(k)];
+                const float vx = x_pos / dim_t[static_cast<size_t>(k)];
+                row[k]                       = (k % 2 == 0) ? std::sin(vy) : std::cos(vy);
+                row[num_pos_feats + k]       = (k % 2 == 0) ? std::sin(vx) : std::cos(vx);
+            }
+        }
+    }
+    return out;
+}
+
+// initial_reference_boxes: sigmoid(transformer.decoder.reference_points.weight).
+// The tensor is stored as [4, 10] col-major in GGUF; we read as row-major so
+// the [num_queries=10, 4] layout comes out as its transpose. Undo it.
+std::vector<float> compute_initial_reference_boxes(const sam3::GgufModel & grounding) {
+    // PyTorch stores nn.Embedding.weight as [num_embeddings=10, embedding_dim=4],
+    // flat layout [q0f0..q0f3, q1f0..q1f3, ...]. GGUF reverses the printed shape
+    // to [4, 10] but the flat data is unchanged, so we can read it as [10, 4]
+    // directly.
+    const auto raw = get_f32(grounding, "transformer.decoder.reference_points.weight", 4 * 10);
+    std::vector<float> refs(10 * 4);
+    for (int i = 0; i < 40; ++i) refs[i] = 1.0f / (1.0f + std::exp(-raw[i]));
+    return refs;
+}
+
+// query_pos_layer_0: sinusoidal encoding of initial_reference_boxes (y,x,w,h
+// ordering, 128 feats per coord) → ref_point_head 2-layer MLP (512→256→256).
+std::vector<float> compute_query_pos_layer_0(
+    const sam3::GgufModel & grounding, const std::vector<float> & ref_boxes
+) {
+    constexpr int64_t Nq = 10;
+    constexpr int64_t H = 256;
+    constexpr int64_t half = H / 2;  // 128
+    const float scale = 2.0f * static_cast<float>(M_PI);
+
+    std::vector<float> dim_t(static_cast<size_t>(half));
+    for (int64_t i = 0; i < half; ++i) {
+        const float exponent = 2.0f * std::floor(static_cast<float>(i) / 2.0f) /
+                                static_cast<float>(half);
+        dim_t[static_cast<size_t>(i)] = std::pow(10000.0f, exponent);
+    }
+    // Sinusoidal encoding, y,x,w,h concat order — mirrors decoder helper.
+    std::vector<float> qs(static_cast<size_t>(Nq * 4 * half));
+    const int order[4] = {1, 0, 2, 3};
+    for (int64_t q = 0; q < Nq; ++q) {
+        for (int slot = 0; slot < 4; ++slot) {
+            const float p = ref_boxes[q * 4 + order[slot]] * scale;
+            for (int64_t i = 0; i < half; ++i) {
+                const float v = p / dim_t[static_cast<size_t>(i)];
+                qs[q * 4 * half + slot * half + i] = (i % 2 == 0) ? std::sin(v) : std::cos(v);
+            }
+        }
+    }
+    // ref_point_head: linear (512→256) + ReLU + linear (256→256)
+    const auto w1 = get_f32(grounding, "transformer.decoder.ref_point_head.layer1.weight", 512 * 256);
+    const auto b1 = get_f32(grounding, "transformer.decoder.ref_point_head.layer1.bias",   256);
+    const auto w2 = get_f32(grounding, "transformer.decoder.ref_point_head.layer2.weight", 256 * 256);
+    const auto b2 = get_f32(grounding, "transformer.decoder.ref_point_head.layer2.bias",   256);
+
+    // Linear + ReLU (layer 1)
+    std::vector<float> h1(Nq * 256);
+    for (int64_t q = 0; q < Nq; ++q) {
+        for (int64_t o = 0; o < 256; ++o) {
+            float s = b1[o];
+            for (int64_t k = 0; k < 512; ++k) s += w1[o * 512 + k] * qs[q * 512 + k];
+            h1[q * 256 + o] = std::max(0.0f, s);
+        }
+    }
+    // Linear (layer 2, no activation)
+    std::vector<float> out(Nq * 256);
+    for (int64_t q = 0; q < Nq; ++q) {
+        for (int64_t o = 0; o < 256; ++o) {
+            float s = b2[o];
+            for (int64_t k = 0; k < 256; ++k) s += w2[o * 256 + k] * h1[q * 256 + k];
+            out[q * 256 + o] = s;
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -332,14 +444,26 @@ int main(int argc, char ** argv) {
     constexpr int64_t kPhraseMax = 32;
     const auto pad_embed = lm_fwd.embed_for_token(0);  // padding = token id 0
 
+    // Compute per-image detr constants once (all objects share them).
+    const auto vision_pos = compute_vision_pos_2d_sincos(72, 72, 256);
+    const auto init_refs  = compute_initial_reference_boxes(grounding);
+    const auto qpos_L0    = compute_query_pos_layer_0(grounding, init_refs);
+    const std::vector<int64_t> vps = {5184, 256};
+    const std::vector<int64_t> rps = {10, 4};
+    const std::vector<int64_t> qps = {10, 256};
+    std::cout << "\n  detr constants computed natively:\n"
+              << "    vision_pos [5184, 256] first=[" << vision_pos[0] << ", "
+                  << vision_pos[1] << ", " << vision_pos[2] << "]\n"
+              << "    init_refs  [10, 4]   first=[" << init_refs[0] << ", "
+                  << init_refs[1] << ", " << init_refs[2] << "]\n"
+              << "    qpos_L0    [10, 256] first=[" << qpos_L0[0] << ", "
+                  << qpos_L0[1] << ", " << qpos_L0[2] << "]\n";
+
     std::cout << "\n=== stage 4: DETR chain per object ===\n";
     std::vector<std::vector<float>> per_obj_masks;
     for (size_t pi = 0; pi < phrases.size(); ++pi) {
         const std::string odir = ref_dir + "/binaries_obj" + std::to_string(pi);
-        std::vector<int64_t> vps, rps, qps;
-        const auto vision_pos = read_bin_f32(odir + "/enc_vision_pos_flat.f32",    vps);
-        const auto init_refs  = read_bin_f32(odir + "/initial_reference_points.f32", rps);
-        const auto qpos_L0    = read_bin_f32(odir + "/query_pos_layer_0.f32",      qps);
+        (void)odir;  // no per-obj ref files needed anymore
 
         // Native: build padded phrase embed tensor, project via text_hidden_fcs.
         std::vector<int32_t> phrase_ids = {151646};  // <|object_ref_start|>
