@@ -40,7 +40,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -68,12 +70,22 @@ std::vector<float> read_bin_f32(const std::string & path, std::vector<int64_t> &
 
 void write_bin_f32(const std::string & path, const std::vector<float> & data,
                    const std::vector<int64_t> & shape) {
+    // Create parent directory tree if it doesn't exist — otherwise
+    // std::ofstream silently fails to open the file and the mask blob
+    // vanishes with no error printed.
+    const auto slash = path.find_last_of('/');
+    if (slash != std::string::npos) {
+        std::filesystem::create_directories(path.substr(0, slash));
+    }
     std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("write_bin_f32: cannot open " + path +
+                                      " (check --out-dir permissions)");
     f.write("BIN1", 4);
     int32_t ndim = static_cast<int32_t>(shape.size());
     f.write(reinterpret_cast<const char *>(&ndim), 4);
     for (int64_t d : shape) f.write(reinterpret_cast<const char *>(&d), 8);
     f.write(reinterpret_cast<const char *>(data.data()), data.size() * sizeof(float));
+    if (!f) throw std::runtime_error("write_bin_f32: write failed for " + path);
 }
 
 std::vector<float> get_f32(const sam3::GgufModel & model, const std::string & name, size_t n) {
@@ -444,11 +456,27 @@ int main(int argc, char ** argv) {
             std::vector<int32_t> gen_tokens;
             std::vector<float> cur_hidden = next_hidden;
             auto tgen = std::chrono::steady_clock::now();
+            // Greedy AR decode. If the first sampled token is <|im_end|>,
+            // take second-best instead — that's almost never what you want
+            // at position 0 for InstructSAM (a real InstructSAM response to
+            // a segmentation query starts with <|object_ref_start|>, and
+            // im_end at token 0 is usually accumulated bf16→f32 drift over
+            // the 301-token prefix ranking it top-1 by a hair).
+            // Beyond token 0, sample as-is and stop on im_end normally.
+            // If the LM doesn't produce object_ref_start naturally it means
+            // the query wasn't interpreted as a segmentation request — pass
+            // an explicit --phrases list instead of --generate in that case.
             for (int step = 0; step < max_new_tokens; ++step) {
                 const auto logits = lm_fwd.logits_for_hidden(cur_hidden);
                 int32_t best = 0; float bv = logits[0];
                 for (int32_t v = 1; v < static_cast<int32_t>(logits.size()); ++v)
                     if (logits[v] > bv) { bv = logits[v]; best = v; }
+                if (step == 0 && best == sp.im_end) {
+                    int32_t alt = -1; float av = -std::numeric_limits<float>::infinity();
+                    for (int32_t v = 0; v < static_cast<int32_t>(logits.size()); ++v)
+                        if (v != sp.im_end && logits[v] > av) { av = logits[v]; alt = v; }
+                    if (alt >= 0) best = alt;
+                }
                 gen_tokens.push_back(best);
                 if (best == sp.im_end) break;
                 const auto emb = lm_fwd.embed_for_token(best);
