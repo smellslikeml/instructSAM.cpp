@@ -138,6 +138,154 @@ void cpu_rope_1d_half(
     }
 }
 
+// ── Per-layer weights bundle (loaded once per layer per forward) ────────
+struct LayerWeights {
+    std::vector<float> attn_norm_w, attn_q_w, attn_k_w, attn_v_w, attn_o_w;
+    std::vector<float> q_norm_w, k_norm_w;
+    std::vector<float> ffn_norm_w, ffn_gate_w, ffn_up_w, ffn_down_w;
+};
+
+LayerWeights load_layer_weights(const GgufModel & model, int layer) {
+    const std::string p = "blk." + std::to_string(layer);
+    LayerWeights w;
+    w.attn_norm_w = get_f32(model, p + ".attn_norm.weight",   kHiddenSize);
+    w.attn_q_w    = get_f32(model, p + ".attn_q.weight",      kHiddenSize * kHiddenSize);
+    w.attn_k_w    = get_f32(model, p + ".attn_k.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
+    w.attn_v_w    = get_f32(model, p + ".attn_v.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
+    w.attn_o_w    = get_f32(model, p + ".attn_output.weight", kHiddenSize * kHiddenSize);
+    w.q_norm_w    = get_f32(model, p + ".attn_q_norm.weight", kHeadDim);
+    w.k_norm_w    = get_f32(model, p + ".attn_k_norm.weight", kHeadDim);
+    w.ffn_norm_w  = get_f32(model, p + ".ffn_norm.weight",    kHiddenSize);
+    w.ffn_gate_w  = get_f32(model, p + ".ffn_gate.weight",    kIntermediate * kHiddenSize);
+    w.ffn_up_w    = get_f32(model, p + ".ffn_up.weight",      kIntermediate * kHiddenSize);
+    w.ffn_down_w  = get_f32(model, p + ".ffn_down.weight",    kHiddenSize * kIntermediate);
+    return w;
+}
+
+// Per-head RMSNorm on Q or K reshape [seq * heads * head_dim].
+void per_head_rms_norm(std::vector<float> & x, int64_t N, int64_t heads,
+                       const std::vector<float> & w) {
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t h = 0; h < heads; ++h) {
+            float * row = x.data() + (n * heads + h) * kHeadDim;
+            double sumsq = 0.0;
+            for (int64_t d = 0; d < kHeadDim; ++d) sumsq += static_cast<double>(row[d]) * row[d];
+            const double inv_rms = 1.0 / std::sqrt(sumsq / kHeadDim + kRmsNormEps);
+            for (int64_t d = 0; d < kHeadDim; ++d) {
+                row[d] = static_cast<float>(row[d] * inv_rms * w[static_cast<size_t>(d)]);
+            }
+        }
+    }
+}
+
+// Per-layer forward with OPTIONAL cached K/V for previous positions.
+//
+// Inputs:
+//   hidden [N, D=2048]        — hidden state for the N NEW positions
+//   positions_new [N]         — absolute RoPE positions for those N tokens
+//   cached_k, cached_v (may be empty) — flat [n_cached * KVH * HD]
+//                                        (post-RoPE K, raw V) from earlier prefill
+//
+// Returns updated hidden [N, D] AND new K/V for this layer (post-RoPE K),
+// each of shape [N * KVH * HD]. Caller appends new K/V into the cache
+// vectors after the call.
+//
+// Attention pattern: causal. New Q at row i attends to
+//   K/V positions [0, n_cached + i] — i.e. all cached tokens (fully causal
+//   already since they came before) plus new tokens 0..i inclusive.
+struct LayerForwardOut {
+    std::vector<float> hidden;   // [N, D]
+    std::vector<float> new_k;    // [N, KVH*HD]
+    std::vector<float> new_v;    // [N, KVH*HD]
+};
+
+LayerForwardOut layer_forward(
+    const std::vector<float> & hidden_in,
+    int64_t N,
+    const std::vector<int32_t> & positions_new,
+    const LayerWeights & w,
+    const std::vector<float> & cached_k,   // may be empty
+    const std::vector<float> & cached_v,   // may be empty
+    int64_t n_cached
+) {
+    // ── Attention block ─────────────────────────────────────────────────
+    const auto residual = hidden_in;
+    const auto normed = cpu_rms_norm(hidden_in, N, kHiddenSize, w.attn_norm_w);
+
+    auto Q_flat = cpu_linear(normed, N, kHiddenSize, kHiddenSize,             w.attn_q_w);
+    auto K_flat = cpu_linear(normed, N, kHiddenSize, kNumKvHeads * kHeadDim,  w.attn_k_w);
+    auto V_flat = cpu_linear(normed, N, kHiddenSize, kNumKvHeads * kHeadDim,  w.attn_v_w);
+
+    per_head_rms_norm(Q_flat, N, kNumHeads,   w.q_norm_w);
+    per_head_rms_norm(K_flat, N, kNumKvHeads, w.k_norm_w);
+    cpu_rope_1d_half(Q_flat, N, kNumHeads,   kHeadDim, positions_new);
+    cpu_rope_1d_half(K_flat, N, kNumKvHeads, kHeadDim, positions_new);
+
+    // Attention. Total sequence length for K/V is n_total = n_cached + N.
+    const int64_t n_total = n_cached + N;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    std::vector<float> attn_out(static_cast<size_t>(N * kHiddenSize), 0.0f);
+
+    for (int64_t h = 0; h < kNumHeads; ++h) {
+        const int64_t kv_h = h / kKvGroups;
+        // For each new row i (absolute pos = n_cached + i), attend to positions [0, n_cached + i].
+        for (int64_t i = 0; i < N; ++i) {
+            const float * qi = Q_flat.data() + (i * kNumHeads + h) * kHeadDim;
+            const int64_t last_pos = n_cached + i;  // inclusive
+            std::vector<float> scores(static_cast<size_t>(last_pos + 1));
+            for (int64_t j = 0; j <= last_pos; ++j) {
+                const float * kj;
+                if (j < n_cached) {
+                    kj = cached_k.data() + (j * kNumKvHeads + kv_h) * kHeadDim;
+                } else {
+                    const int64_t j_new = j - n_cached;
+                    kj = K_flat.data() + (j_new * kNumKvHeads + kv_h) * kHeadDim;
+                }
+                float s = 0.0f;
+                for (int64_t d = 0; d < kHeadDim; ++d) s += qi[d] * kj[d];
+                scores[static_cast<size_t>(j)] = s * scale;
+            }
+            // Softmax
+            float m = scores[0];
+            for (int64_t j = 1; j <= last_pos; ++j) if (scores[j] > m) m = scores[j];
+            float sum = 0.0f;
+            for (int64_t j = 0; j <= last_pos; ++j) { scores[j] = std::exp(scores[j] - m); sum += scores[j]; }
+            for (int64_t j = 0; j <= last_pos; ++j) scores[j] /= sum;
+            // Weighted sum with V
+            for (int64_t d = 0; d < kHeadDim; ++d) {
+                float y = 0.0f;
+                for (int64_t j = 0; j <= last_pos; ++j) {
+                    const float * vj;
+                    if (j < n_cached) {
+                        vj = cached_v.data() + (j * kNumKvHeads + kv_h) * kHeadDim;
+                    } else {
+                        const int64_t j_new = j - n_cached;
+                        vj = V_flat.data() + (j_new * kNumKvHeads + kv_h) * kHeadDim;
+                    }
+                    y += scores[static_cast<size_t>(j)] * vj[d];
+                }
+                attn_out[static_cast<size_t>(i * kHiddenSize + h * kHeadDim + d)] = y;
+            }
+        }
+    }
+
+    // O proj + residual
+    const auto attn_proj = cpu_linear(attn_out, N, kHiddenSize, kHiddenSize, w.attn_o_w);
+    std::vector<float> hidden(residual.size());
+    for (size_t i = 0; i < hidden.size(); ++i) hidden[i] = residual[i] + attn_proj[i];
+
+    // ── MLP block ────────────────────────────────────────────────────────
+    const auto residual2 = hidden;
+    const auto normed2 = cpu_rms_norm(hidden, N, kHiddenSize, w.ffn_norm_w);
+    auto gate_out = cpu_linear(normed2, N, kHiddenSize, kIntermediate, w.ffn_gate_w);
+    const auto up_out   = cpu_linear(normed2, N, kHiddenSize, kIntermediate, w.ffn_up_w);
+    cpu_silu_mul(gate_out, up_out);
+    const auto down_out = cpu_linear(gate_out, N, kIntermediate, kHiddenSize, w.ffn_down_w);
+    for (size_t i = 0; i < hidden.size(); ++i) hidden[i] = residual2[i] + down_out[i];
+
+    return LayerForwardOut{ std::move(hidden), std::move(K_flat), std::move(V_flat) };
+}
+
 std::vector<std::string> per_layer_tensor_names(int layer) {
     const std::string p = "blk." + std::to_string(layer);
     return {
@@ -400,6 +548,115 @@ std::vector<float> InstructsamLmForward::extract_seg_output_embeddings(
     for (int64_t j = 0; j < 10; ++j) {
         std::memcpy(seg_out.data() + j * kHiddenSize,
                     final_hidden.data() + (n_prompt + 1 + j) * kHiddenSize,
+                    kHiddenSize * sizeof(float));
+    }
+    return seg_out;
+}
+
+InstructsamLmForward::KvCache InstructsamLmForward::prefill_prefix(
+    const std::vector<float> & prefix_embeds,
+    int64_t n_prefix,
+    const std::vector<int32_t> & positions
+) const {
+    if (prefix_embeds.size() != static_cast<size_t>(n_prefix * kHiddenSize)) {
+        throw std::runtime_error("prefill_prefix: embeds size mismatch");
+    }
+    if (positions.size() != static_cast<size_t>(n_prefix)) {
+        throw std::runtime_error("prefill_prefix: positions size mismatch");
+    }
+
+    KvCache cache;
+    cache.k.resize(kNumLayers);
+    cache.v.resize(kNumLayers);
+    cache.n_cached = n_prefix;
+
+    std::vector<float> hidden = prefix_embeds;
+    for (int layer = 0; layer < kNumLayers; ++layer) {
+        const auto w = load_layer_weights(model_, layer);
+        auto out = layer_forward(hidden, n_prefix, positions, w,
+                                 /*cached_k=*/{}, /*cached_v=*/{}, /*n_cached=*/0);
+        hidden        = std::move(out.hidden);
+        cache.k[layer] = std::move(out.new_k);
+        cache.v[layer] = std::move(out.new_v);
+    }
+    // Note: we discard `hidden` (post-transformer, pre-output_norm). Callers
+    // that need it can compute cpu_rms_norm(hidden, ..., output_norm_w) but
+    // that's not the cache's job.
+    return cache;
+}
+
+std::vector<float> InstructsamLmForward::extract_seg_output_embeddings_with_cache(
+    const KvCache & prefix_cache,
+    const std::vector<float> & appended_prefix_embeds,
+    int64_t n_appended_prefix,
+    const std::vector<float> & mask_queries,
+    const std::vector<float> & mask_start_embed,
+    const std::vector<float> & mask_end_embed
+) const {
+    if (mask_queries.size() != 10 * kHiddenSize) {
+        throw std::runtime_error("with_cache: mask_queries must be [10, 2048]");
+    }
+    if (mask_start_embed.size() != kHiddenSize || mask_end_embed.size() != kHiddenSize) {
+        throw std::runtime_error("with_cache: mask_start/end embeds must be [2048]");
+    }
+    if (n_appended_prefix < 0 ||
+        appended_prefix_embeds.size() != static_cast<size_t>(n_appended_prefix * kHiddenSize)) {
+        throw std::runtime_error("with_cache: appended_prefix shape mismatch");
+    }
+    if (prefix_cache.k.size() != kNumLayers || prefix_cache.v.size() != kNumLayers) {
+        throw std::runtime_error("with_cache: cache layer count mismatch");
+    }
+
+    // Build the delta sequence to decode:
+    //   [appended_prefix (n_appended_prefix)] +
+    //   [mask_start, 10 mask_queries, mask_end]  (12 tokens)
+    const int64_t n_inject = 12;
+    const int64_t n_new = n_appended_prefix + n_inject;
+    const int64_t n_cached = prefix_cache.n_cached;
+
+    std::vector<float> new_embeds(static_cast<size_t>(n_new * kHiddenSize));
+    std::vector<int32_t> positions_new(static_cast<size_t>(n_new));
+
+    // (a) appended_prefix (e.g. <|object_ref_start|> + phrase + <|object_ref_end|>)
+    std::memcpy(new_embeds.data(), appended_prefix_embeds.data(),
+                static_cast<size_t>(n_appended_prefix * kHiddenSize) * sizeof(float));
+    for (int64_t i = 0; i < n_appended_prefix; ++i) {
+        positions_new[i] = static_cast<int32_t>(n_cached + i);
+    }
+    // (b) mask_start
+    const int64_t inj0 = n_appended_prefix;
+    std::memcpy(new_embeds.data() + inj0 * kHiddenSize, mask_start_embed.data(),
+                kHiddenSize * sizeof(float));
+    positions_new[inj0] = static_cast<int32_t>(n_cached + inj0);
+    // (c) 10 mask_queries
+    for (int64_t j = 0; j < 10; ++j) {
+        std::memcpy(new_embeds.data() + (inj0 + 1 + j) * kHiddenSize,
+                    mask_queries.data() + j * kHiddenSize, kHiddenSize * sizeof(float));
+        positions_new[inj0 + 1 + j] = static_cast<int32_t>(n_cached + inj0 + 1 + j);
+    }
+    // (d) mask_end
+    std::memcpy(new_embeds.data() + (inj0 + 11) * kHiddenSize, mask_end_embed.data(),
+                kHiddenSize * sizeof(float));
+    positions_new[inj0 + 11] = static_cast<int32_t>(n_cached + inj0 + 11);
+
+    // Run 28 layers, feeding each layer's cached K/V from prefix_cache.
+    std::vector<float> hidden = new_embeds;
+    for (int layer = 0; layer < kNumLayers; ++layer) {
+        const auto w = load_layer_weights(model_, layer);
+        auto out = layer_forward(hidden, n_new, positions_new, w,
+                                 prefix_cache.k[layer], prefix_cache.v[layer], n_cached);
+        hidden = std::move(out.hidden);
+    }
+
+    // Final RMSNorm on the n_new hidden states
+    const auto output_norm_w = get_f32(model_, "output_norm.weight", kHiddenSize);
+    const auto final_hidden = cpu_rms_norm(hidden, n_new, kHiddenSize, output_norm_w);
+
+    // Extract slots at [inj0+1 .. inj0+10] — the 10 mask_queries positions
+    std::vector<float> seg_out(10 * kHiddenSize);
+    for (int64_t j = 0; j < 10; ++j) {
+        std::memcpy(seg_out.data() + j * kHiddenSize,
+                    final_hidden.data() + (inj0 + 1 + j) * kHiddenSize,
                     kHiddenSize * sizeof(float));
     }
     return seg_out;

@@ -237,8 +237,7 @@ int main(int argc, char ** argv) {
             seg_outs.push_back(std::move(so));
         }
     } else {
-        std::cout << "\n=== stage 3: LM (--run-lm — native forward) ===\n"
-                     "  WARNING: no KV cache. 300+ token forward is O(N²·D) — many minutes per phrase.\n" << std::flush;
+        std::cout << "\n=== stage 3: LM (--run-lm — native forward, KV-cached prefix) ===\n" << std::flush;
         const auto full_tokens = tokz->tokenize_chat(query);
         const auto & sp = tokz->specials();
         size_t image_pad_pos = 0;
@@ -273,6 +272,16 @@ int main(int argc, char ** argv) {
         const auto mask_start   = read_bin_f32("/tmp/pathA_reference/instructsam_mask_start_embed.f32", ms_s);
         const auto mask_end     = read_bin_f32("/tmp/pathA_reference/instructsam_mask_end_embed.f32",   me_s);
 
+        // Prefill the shared prefix (text + image + text) exactly once.
+        std::vector<int32_t> pref_pos(n_prefix);
+        for (size_t i = 0; i < n_prefix; ++i) pref_pos[i] = static_cast<int32_t>(i);
+        auto tpref = std::chrono::steady_clock::now();
+        auto prefix_cache = lm_fwd.prefill_prefix(
+            prefix_embeds, static_cast<int64_t>(n_prefix), pref_pos);
+        std::cout << "  ✓ prefill_prefix (" << n_prefix << " tokens) in "
+                  << std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - tpref).count() << "s\n";
+
         auto tokenize_phrase = [&](const std::string & p) -> std::vector<int32_t> {
             if (p == "box")      return {3745};
             if (p == "person")   return {1697};
@@ -285,20 +294,20 @@ int main(int argc, char ** argv) {
             std::vector<int32_t> appended = {sp.object_ref_start};
             for (int32_t t : ptoks) appended.push_back(t);
             appended.push_back(sp.object_ref_end);
-            std::vector<float> ext(prefix_embeds);
-            ext.resize((n_prefix + appended.size()) * H);
+            std::vector<float> ap_embeds(appended.size() * H);
             for (size_t i = 0; i < appended.size(); ++i) {
                 const auto e = lm_fwd.embed_for_token(appended[i]);
-                std::memcpy(ext.data() + (n_prefix + i) * H, e.data(), H * sizeof(float));
+                std::memcpy(ap_embeds.data() + i * H, e.data(), H * sizeof(float));
             }
             auto tphr = std::chrono::steady_clock::now();
-            auto so = lm_fwd.extract_seg_output_embeddings_from_prefix(
-                ext, static_cast<int64_t>(n_prefix + appended.size()),
+            auto so = lm_fwd.extract_seg_output_embeddings_with_cache(
+                prefix_cache, ap_embeds, static_cast<int64_t>(appended.size()),
                 mask_queries, mask_start, mask_end);
             seg_outs.push_back(std::move(so));
             std::cout << "  ✓ phrase \"" << phrases[pi] << "\" ("
                       << std::chrono::duration_cast<std::chrono::seconds>(
-                             std::chrono::steady_clock::now() - tphr).count() << "s)\n";
+                             std::chrono::steady_clock::now() - tphr).count()
+                      << "s decode w/ cached " << n_prefix << "-token prefix)\n";
         }
     }
 

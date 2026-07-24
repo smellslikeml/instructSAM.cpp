@@ -102,6 +102,53 @@ public:
         const std::vector<float> & mask_end_embed       // [2048]
     ) const;
 
+    // ── KV cache for prefill-then-decode ─────────────────────────────────
+    //
+    // Motivating problem: extract_seg_output_embeddings_from_prefix() runs
+    // a full O(N²·D) forward on 300+ tokens per call. When the CLI computes
+    // 4 phrases sharing the same [text + image + text] prefix, that's 4×
+    // duplicate prefix work.
+    //
+    // KvCache stores per-layer K and V for a fixed prefix. `prefill_prefix`
+    // populates it once (~one full-cost forward). Then
+    // `extract_seg_output_embeddings_with_cache` runs a decode over just
+    // the appended tokens per phrase, attending to prefix K/V from cache
+    // + new K/V computed on the fly. Same numerical result as the
+    // no-cache version, but the per-phrase forward is O((n_new)² + n_cached·n_new)
+    // in attention and O(n_new·D²) in projections — much smaller than
+    // O(n_total² · D + n_total · D²).
+    struct KvCache {
+        // Per-layer flat K and V — each [n_cached, num_kv_heads=8, head_dim=128]
+        // as a flat float vector of length n_cached * 1024. K/V here are
+        // post-RoPE (K) and raw (V), ready for attention with the
+        // concatenated new K/V without further transformation.
+        std::vector<std::vector<float>> k;  // size num_layers=28
+        std::vector<std::vector<float>> v;
+        int64_t n_cached = 0;
+    };
+
+    // Run prefill on `prefix_embeds` and return the populated cache.
+    // `positions` gives the RoPE position for each of the n_prefix tokens
+    // (typically 0..n_prefix-1). Cost: same as one full run() on the prefix.
+    KvCache prefill_prefix(
+        const std::vector<float> & prefix_embeds,
+        int64_t n_prefix,
+        const std::vector<int32_t> & positions
+    ) const;
+
+    // Same shape/return as extract_seg_output_embeddings_from_prefix, but
+    // reuses a pre-computed prefix cache. Only the appended ~14-token
+    // sequence is decoded per call, so this can be looped over phrases
+    // sharing a common cache without recomputing the prefix each time.
+    std::vector<float> extract_seg_output_embeddings_with_cache(
+        const KvCache & prefix_cache,
+        const std::vector<float> & appended_prefix_embeds,  // [n_ap, 2048]
+        int64_t n_appended_prefix,  // e.g. <|object_ref_start|>+phrase+<|object_ref_end|>
+        const std::vector<float> & mask_queries,
+        const std::vector<float> & mask_start_embed,
+        const std::vector<float> & mask_end_embed
+    ) const;
+
     // Look up a token's INPUT embedding from token_embd.weight.
     // Handy for building the phrase_embeddings input to text_hidden_fcs
     // (piece 4b). Also for constructing the initial embed sequence in the
