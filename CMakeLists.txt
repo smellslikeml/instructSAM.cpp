@@ -350,6 +350,23 @@ if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
         OpenMP::OpenMP_CXX
         m dl)
 
+    # AR generation sanity test
+    add_executable(sam3-instructsam-lm-generate-test tools/sam3_instructsam_lm_generate_test.cpp)
+    target_include_directories(sam3-instructsam-lm-generate-test PRIVATE
+        "${LLAMA_CPP_ROOT}/include")
+    target_link_libraries(sam3-instructsam-lm-generate-test PRIVATE
+        sam3cpp
+        sam3cpp_llama_tokenizer
+        "${LLAMA_CPP_ROOT}/build/src/libllama.a"
+        "-Wl,--whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-cpu.a"
+        "-Wl,--no-whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml.a"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-base.a"
+        Threads::Threads
+        OpenMP::OpenMP_CXX
+        m dl)
+
     # Day 9d — end-to-end CLI
     add_executable(sam3-instructsam-cli tools/sam3_instructsam_cli.cpp)
     target_include_directories(sam3-instructsam-cli PRIVATE

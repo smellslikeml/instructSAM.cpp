@@ -585,6 +585,110 @@ InstructsamLmForward::KvCache InstructsamLmForward::prefill_prefix(
     return cache;
 }
 
+InstructsamLmForward::PrefillResult InstructsamLmForward::prefill_with_last_hidden(
+    const std::vector<float> & prefix_embeds,
+    int64_t n_prefix,
+    const std::vector<int32_t> & positions
+) const {
+    if (prefix_embeds.size() != static_cast<size_t>(n_prefix * kHiddenSize)) {
+        throw std::runtime_error("prefill_with_last_hidden: embeds size mismatch");
+    }
+    if (positions.size() != static_cast<size_t>(n_prefix)) {
+        throw std::runtime_error("prefill_with_last_hidden: positions size mismatch");
+    }
+
+    PrefillResult r;
+    r.cache.k.resize(kNumLayers);
+    r.cache.v.resize(kNumLayers);
+    r.cache.n_cached = n_prefix;
+
+    std::vector<float> hidden = prefix_embeds;
+    for (int layer = 0; layer < kNumLayers; ++layer) {
+        const auto w = load_layer_weights(model_, layer);
+        auto out = layer_forward(hidden, n_prefix, positions, w, /*cached_k=*/{}, /*cached_v=*/{}, 0);
+        hidden          = std::move(out.hidden);
+        r.cache.k[layer] = std::move(out.new_k);
+        r.cache.v[layer] = std::move(out.new_v);
+    }
+    // Apply output_norm to the final position only.
+    const auto output_norm_w = get_f32(model_, "output_norm.weight", kHiddenSize);
+    // Extract last-position hidden [2048]
+    std::vector<float> last_pre(kHiddenSize);
+    std::memcpy(last_pre.data(),
+                hidden.data() + (n_prefix - 1) * kHiddenSize,
+                kHiddenSize * sizeof(float));
+    r.last_hidden = cpu_rms_norm(last_pre, 1, kHiddenSize, output_norm_w);
+    return r;
+}
+
+std::vector<float> InstructsamLmForward::decode_step(
+    KvCache & cache_mutable,
+    const std::vector<float> & new_embed,
+    int32_t new_position
+) const {
+    if (new_embed.size() != static_cast<size_t>(kHiddenSize)) {
+        throw std::runtime_error("decode_step: embed must be [2048]");
+    }
+    if (cache_mutable.k.size() != kNumLayers || cache_mutable.v.size() != kNumLayers) {
+        throw std::runtime_error("decode_step: cache layer count mismatch");
+    }
+    const std::vector<int32_t> pos_new = { new_position };
+    std::vector<float> hidden = new_embed;
+    for (int layer = 0; layer < kNumLayers; ++layer) {
+        const auto w = load_layer_weights(model_, layer);
+        auto out = layer_forward(hidden, /*N=*/1, pos_new, w,
+                                 cache_mutable.k[layer], cache_mutable.v[layer],
+                                 cache_mutable.n_cached);
+        hidden = std::move(out.hidden);
+        // Append new K/V to the cache (each is [1 * KVH * HD] = 1024 floats)
+        cache_mutable.k[layer].insert(cache_mutable.k[layer].end(),
+                                      out.new_k.begin(), out.new_k.end());
+        cache_mutable.v[layer].insert(cache_mutable.v[layer].end(),
+                                      out.new_v.begin(), out.new_v.end());
+    }
+    cache_mutable.n_cached += 1;
+    const auto output_norm_w = get_f32(model_, "output_norm.weight", kHiddenSize);
+    return cpu_rms_norm(hidden, 1, kHiddenSize, output_norm_w);
+}
+
+std::vector<float> InstructsamLmForward::logits_for_hidden(
+    const std::vector<float> & hidden_2048
+) const {
+    if (hidden_2048.size() != static_cast<size_t>(kHiddenSize)) {
+        throw std::runtime_error("logits_for_hidden: input must be [2048]");
+    }
+    // Qwen3-VL ties input embedding for LM head. token_embd.weight is
+    // stored [hidden=2048, vocab=151936] col-major-in-ggml — meaning per-token
+    // row of size 2048 starts at offset token_id * 2048 * dtype. So
+    // logits[t] = sum_d hidden[d] * embed[t, d].
+    ggml_tensor * emb = require_tensor(model_, "token_embd.weight");
+    std::vector<float> logits(static_cast<size_t>(kVocabSize), 0.0f);
+    if (emb->type == GGML_TYPE_F32) {
+        std::vector<float> row(kHiddenSize);
+        for (int32_t t = 0; t < kVocabSize; ++t) {
+            ggml_backend_tensor_get(emb, row.data(),
+                static_cast<size_t>(t) * kHiddenSize * sizeof(float),
+                kHiddenSize * sizeof(float));
+            float s = 0.0f;
+            for (int d = 0; d < kHiddenSize; ++d) s += hidden_2048[d] * row[d];
+            logits[static_cast<size_t>(t)] = s;
+        }
+    } else if (emb->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> row(kHiddenSize);
+        for (int32_t t = 0; t < kVocabSize; ++t) {
+            ggml_backend_tensor_get(emb, row.data(),
+                static_cast<size_t>(t) * kHiddenSize * sizeof(ggml_fp16_t),
+                kHiddenSize * sizeof(ggml_fp16_t));
+            float s = 0.0f;
+            for (int d = 0; d < kHiddenSize; ++d) s += hidden_2048[d] * ggml_fp16_to_fp32(row[d]);
+            logits[static_cast<size_t>(t)] = s;
+        }
+    } else {
+        throw std::runtime_error("logits_for_hidden: unsupported dtype for token_embd");
+    }
+    return logits;
+}
+
 std::vector<float> InstructsamLmForward::extract_seg_output_embeddings_with_cache(
     const KvCache & prefix_cache,
     const std::vector<float> & appended_prefix_embeds,

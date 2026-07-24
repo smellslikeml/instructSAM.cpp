@@ -149,6 +149,35 @@ public:
         const std::vector<float> & mask_end_embed
     ) const;
 
+    // ── Autoregressive generation support ────────────────────────────────
+
+    // Prefill + return final hidden state (post-output_norm) at the last
+    // position, ready to project via `logits_for_hidden` for the first
+    // sampled token.
+    struct PrefillResult {
+        KvCache cache;
+        std::vector<float> last_hidden;  // [2048], AFTER output_norm
+    };
+    PrefillResult prefill_with_last_hidden(
+        const std::vector<float> & prefix_embeds,
+        int64_t n_prefix,
+        const std::vector<int32_t> & positions
+    ) const;
+
+    // Decode a single new token (given its embed + absolute position) and
+    // EXTEND the cache in place. Returns the token's hidden state after
+    // output_norm — feed to logits_for_hidden for next-token prediction.
+    std::vector<float> decode_step(
+        KvCache & cache_mutable,
+        const std::vector<float> & new_embed,  // [2048]
+        int32_t new_position
+    ) const;
+
+    // LM head: project [2048] hidden → [vocab_size=151936] logits.
+    // Qwen3-VL ties the input embedding table for output — no separate
+    // output.weight. logits = hidden @ token_embd.weight.T
+    std::vector<float> logits_for_hidden(const std::vector<float> & hidden_2048) const;
+
     // Look up a token's INPUT embedding from token_embd.weight.
     // Handy for building the phrase_embeddings input to text_hidden_fcs
     // (piece 4b). Also for constructing the initial embed sequence in the

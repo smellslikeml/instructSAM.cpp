@@ -240,6 +240,8 @@ int main(int argc, char ** argv) {
     std::string out_dir = "/tmp/pathA_reference/warehouse_rgb";
     bool use_cached_vision = true;
     bool use_cached_lm = true;  // Native LM at 300+ tokens is O(N²·D) with no KV cache — hours per phrase.
+    bool generate_phrases = false;  // --generate: LM AR generation to discover phrases
+    int32_t max_new_tokens = 128;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -255,6 +257,8 @@ int main(int argc, char ** argv) {
         else if (a == "--run-vision") use_cached_vision = false;
         else if (a == "--use-cached-lm") use_cached_lm = true;
         else if (a == "--run-lm") use_cached_lm = false;
+        else if (a == "--generate") { generate_phrases = true; use_cached_lm = false; }
+        else if (a == "--max-new-tokens" && i+1 < argc) max_new_tokens = std::atoi(argv[++i]);
         else if (a == "--help" || a == "-h") {
             std::cout << "sam3-instructsam-cli\n"
                          "  --image PATH        (default: warehouse_rgb.jpg)\n"
@@ -331,6 +335,9 @@ int main(int argc, char ** argv) {
 
     // ── LM path: two modes ──────────────────────────────────────────────
     std::vector<std::vector<float>> seg_outs;
+    // Populated by the --generate branch; empty means "fall back to hardcoded
+    // phrase→tokens map" for the text_features section below.
+    std::vector<std::vector<int32_t>> generated_phrase_tokens_outer;
     if (use_cached_lm) {
         std::cout << "\n=== stage 3: LM (--use-cached-lm — loading PyTorch seg_output) ===\n"
                      "  (--run-lm swaps in native LM forward; very slow without KV cache)\n";
@@ -385,13 +392,17 @@ int main(int argc, char ** argv) {
         const auto mask_start   = read_bin_f32("/tmp/pathA_reference/instructsam_mask_start_embed.f32", ms_s);
         const auto mask_end     = read_bin_f32("/tmp/pathA_reference/instructsam_mask_end_embed.f32",   me_s);
 
-        // Prefill the shared prefix (text + image + text) exactly once.
+        // Prefill the shared prefix (text + image + text) with a bonus:
+        // grab the last hidden state so we can start free-form generation
+        // if --generate is set.
         std::vector<int32_t> pref_pos(n_prefix);
         for (size_t i = 0; i < n_prefix; ++i) pref_pos[i] = static_cast<int32_t>(i);
         auto tpref = std::chrono::steady_clock::now();
-        auto prefix_cache = lm_fwd.prefill_prefix(
+        auto pfr = lm_fwd.prefill_with_last_hidden(
             prefix_embeds, static_cast<int64_t>(n_prefix), pref_pos);
-        std::cout << "  ✓ prefill_prefix (" << n_prefix << " tokens) in "
+        auto prefix_cache = std::move(pfr.cache);
+        std::vector<float> next_hidden = std::move(pfr.last_hidden);
+        std::cout << "  ✓ prefill_with_last_hidden (" << n_prefix << " tokens) in "
                   << std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::steady_clock::now() - tpref).count() << "s\n";
 
@@ -405,8 +416,62 @@ int main(int argc, char ** argv) {
             if (p == "forklift") return {44738, 34969};  // "fork" + "lift"
             throw std::runtime_error("phrase not in built-in map: " + p);
         };
+
+        // ── Free-form generation branch ─────────────────────────────────
+        // Overrides `phrases` with names extracted from the LM's own output.
+        // We generate a working cache copy so seg_output extraction below
+        // still starts from the pristine prefix cache.
+        std::vector<std::vector<int32_t>> generated_phrase_tokens;
+        if (generate_phrases) {
+            std::cout << "\n=== stage 3b: --generate — greedy AR decode ===\n" << std::flush;
+            auto gen_cache = prefix_cache;  // deep copy — decode_step will extend it
+            std::vector<int32_t> gen_tokens;
+            std::vector<float> cur_hidden = next_hidden;
+            auto tgen = std::chrono::steady_clock::now();
+            for (int step = 0; step < max_new_tokens; ++step) {
+                const auto logits = lm_fwd.logits_for_hidden(cur_hidden);
+                int32_t best = 0; float bv = logits[0];
+                for (int32_t v = 1; v < static_cast<int32_t>(logits.size()); ++v)
+                    if (logits[v] > bv) { bv = logits[v]; best = v; }
+                gen_tokens.push_back(best);
+                if (best == sp.im_end) break;
+                const auto emb = lm_fwd.embed_for_token(best);
+                cur_hidden = lm_fwd.decode_step(gen_cache, emb,
+                                                static_cast<int32_t>(n_prefix + step));
+            }
+            const auto gen_s = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - tgen).count();
+            std::cout << "  ✓ generated " << gen_tokens.size() << " tokens in " << gen_s << "s\n";
+            std::cout << "  raw: " << tokz->detokenize(gen_tokens) << "\n";
+
+            // Extract phrases between object_ref_start and object_ref_end
+            phrases.clear();
+            for (size_t i = 0; i < gen_tokens.size(); ++i) {
+                if (gen_tokens[i] == sp.object_ref_start) {
+                    size_t j = i + 1;
+                    while (j < gen_tokens.size() && gen_tokens[j] != sp.object_ref_end) ++j;
+                    if (j < gen_tokens.size()) {
+                        std::vector<int32_t> mid(gen_tokens.begin() + i + 1,
+                                                 gen_tokens.begin() + j);
+                        phrases.push_back(tokz->detokenize(mid));
+                        generated_phrase_tokens.push_back(mid);
+                    }
+                    i = j;
+                }
+            }
+            std::cout << "  extracted " << phrases.size() << " phrase(s): ";
+            for (auto & p : phrases) std::cout << "\"" << p << "\" ";
+            std::cout << "\n";
+            if (phrases.empty()) {
+                std::cerr << "  ✗ no phrases found — try a different query or increase --max-new-tokens\n";
+                return 5;
+            }
+            generated_phrase_tokens_outer = generated_phrase_tokens;
+        }
+
         for (size_t pi = 0; pi < phrases.size(); ++pi) {
-            const auto ptoks = tokenize_phrase(phrases[pi]);
+            const auto ptoks = generate_phrases ? generated_phrase_tokens[pi]
+                                                 : tokenize_phrase(phrases[pi]);
             std::vector<int32_t> appended = {sp.object_ref_start};
             for (int32_t t : ptoks) appended.push_back(t);
             appended.push_back(sp.object_ref_end);
@@ -467,7 +532,10 @@ int main(int argc, char ** argv) {
 
         // Native: build padded phrase embed tensor, project via text_hidden_fcs.
         std::vector<int32_t> phrase_ids = {151646};  // <|object_ref_start|>
-        for (int32_t t : tokenize_phrase_for_text(phrases[pi])) phrase_ids.push_back(t);
+        const auto & inner = (pi < generated_phrase_tokens_outer.size())
+            ? generated_phrase_tokens_outer[pi]
+            : tokenize_phrase_for_text(phrases[pi]);
+        for (int32_t t : inner) phrase_ids.push_back(t);
         phrase_ids.push_back(151647);  // <|object_ref_end|>
         const int64_t n_valid = static_cast<int64_t>(phrase_ids.size());
         std::vector<float> phrase_padded(kPhraseMax * kPhraseH, 0.0f);
