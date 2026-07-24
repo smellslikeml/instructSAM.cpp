@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-# sam3-instructsam — natural-language image segmentation, CPU-only.
+# instructsam — natural-language image segmentation, CPU-only.
 #
 # Builds a self-contained image whose entrypoint is `instructsam`.
 # Weights are converted from CircleRadon/InstructSAM-2B AT BUILD TIME
@@ -7,13 +7,13 @@
 # published image is a self-contained runtime — no HF pull at run-time.
 #
 # Build (from repo root):
-#   docker build -f docker/Dockerfile -t sam3-instructsam:latest .
+#   docker build -f docker/Dockerfile -t instructsam:latest .
 #
 # Run (mount an input image + output dir):
 #   docker run --rm \
 #     -v /path/to/images:/in \
 #     -v /path/to/out:/out \
-#     sam3-instructsam:latest \
+#     instructsam:latest \
 #       --image /in/warehouse.jpg \
 #       --query "Please segment 'box', 'person', 'forklift' in this image." \
 #       --out-dir /out --run-vision
@@ -27,7 +27,7 @@
 #   so you inherit whatever terms apply to their upstream — we do not
 #   redistribute derived weights in the image layers that get published.
 
-# ── Stage 1: build llama.cpp + sam3cpp + convert weights ───────────────
+# ── Stage 1: build llama.cpp + instructsam + convert weights ───────────
 FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -48,21 +48,21 @@ RUN python3 -m venv /opt/convert-venv \
 
 WORKDIR /src
 
-# sam3cpp source. Default is COPY from the build context so this Dockerfile
+# instructsam source. Default is COPY from the build context so this Dockerfile
 # works against the local checkout without needing to push a branch. Set
 # --build-arg SAM3CPP_SOURCE=git to clone from GitHub instead (useful for
 # reproducible builds off a tag).
 ARG SAM3CPP_SOURCE=copy
-ARG SAM3CPP_REPO=https://github.com/smellslikeml/sam3cpp.git
-ARG SAM3CPP_BRANCH=feat/instructsam-decoder
+ARG SAM3CPP_REPO=https://github.com/smellslikeml/instructSAM.cpp.git
+ARG SAM3CPP_BRANCH=main
 
 # COPY is unconditional (Docker can't skip it), so we accept the copy
 # either way and then optionally override with a git clone. This costs a
 # few MB of layer bloat when SAM3CPP_SOURCE=git; not worth branching over.
-COPY . /src/sam3cpp
+COPY . /src/instructsam
 RUN if [ "${SAM3CPP_SOURCE}" = "git" ]; then \
-        rm -rf /src/sam3cpp && \
-        git clone --depth=1 --branch "${SAM3CPP_BRANCH}" "${SAM3CPP_REPO}" /src/sam3cpp; \
+        rm -rf /src/instructsam && \
+        git clone --depth=1 --branch "${SAM3CPP_BRANCH}" "${SAM3CPP_REPO}" /src/instructsam; \
     fi
 
 # Clone + build llama.cpp at the pinned commit, applying the InstructSAM
@@ -70,7 +70,7 @@ RUN if [ "${SAM3CPP_SOURCE}" = "git" ]; then \
 RUN git clone https://github.com/ggml-org/llama.cpp.git \
     && cd llama.cpp \
     && git checkout "${LLAMA_CPP_COMMIT}" \
-    && git apply /src/sam3cpp/docs/instructsam/llamacpp-qwen3vl-instructsam-filter.patch
+    && git apply /src/instructsam/docs/instructsam/llamacpp-qwen3vl-instructsam-filter.patch
 
 # Install conversion deps from llama.cpp's pinned list.
 RUN /opt/convert-venv/bin/pip install --no-cache-dir \
@@ -97,14 +97,14 @@ snapshot_download('${INSTRUCTSAM_REPO}', local_dir='/src/instructsam-src', local
 # converter sees a vanilla Qwen3VLForConditionalGeneration checkpoint.
 # (Mirrors tools/pathb_convert_lm_mmproj.sh steps 2 + 3. Actual rewrite
 # logic lives in docker/rewrite_config_for_qwen3vl.py which we already
-# COPYed in as part of /src/sam3cpp.)
+# COPYed in as part of /src/instructsam.)
 RUN mkdir -p /src/instructsam-as-qwen3vl && \
     cp /src/instructsam-src/model.safetensors  /src/instructsam-as-qwen3vl/ && \
     cp /src/instructsam-src/tokenizer.json     /src/instructsam-as-qwen3vl/ && \
     for f in chat_template.jinja generation_config.json processor_config.json; do \
         [ -f "/src/instructsam-src/$f" ] && cp "/src/instructsam-src/$f" /src/instructsam-as-qwen3vl/ ; \
     done && \
-    /opt/convert-venv/bin/python /src/sam3cpp/docker/rewrite_config_for_qwen3vl.py \
+    /opt/convert-venv/bin/python /src/instructsam/docker/rewrite_config_for_qwen3vl.py \
         /src/instructsam-src /src/instructsam-as-qwen3vl
 
 # Convert LM half (f16 for accuracy) + Q4_K_M quant (default runtime).
@@ -134,15 +134,15 @@ RUN cd /src/llama.cpp \
 # Convert grounding half (DETR + FPN + mask decoder + dot_prod_scoring)
 # and extract the mask_queries sidecar.
 RUN /opt/convert-venv/bin/pip install --no-cache-dir gguf safetensors torch --extra-index-url https://download.pytorch.org/whl/cpu \
-    && /opt/convert-venv/bin/python /src/sam3cpp/tools/convert_instructsam_to_gguf.py \
+    && /opt/convert-venv/bin/python /src/instructsam/tools/convert_instructsam_to_gguf.py \
         --input  /src/instructsam-src/model.safetensors \
         --output /models/instructsam-grounding-f16.gguf \
-    && /opt/convert-venv/bin/python /src/sam3cpp/tools/extract_mask_queries.py \
+    && /opt/convert-venv/bin/python /src/instructsam/tools/extract_mask_queries.py \
         --input  /src/instructsam-src/model.safetensors \
         --output /models/instructsam_mask_queries.f32
 
-# Build sam3cpp against the just-built llama.cpp tree.
-RUN cd /src/sam3cpp \
+# Build instructsam against the just-built llama.cpp tree.
+RUN cd /src/instructsam \
     && cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target instructsam --parallel "$(nproc)"
@@ -161,7 +161,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary + models.
-COPY --from=builder /src/sam3cpp/build/instructsam /usr/local/bin/instructsam
+COPY --from=builder /src/instructsam/build/instructsam /usr/local/bin/instructsam
 COPY --from=builder /models /models
 
 # Default model paths — override with --lm / --mmproj / --grounding /

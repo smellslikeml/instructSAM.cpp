@@ -1,141 +1,81 @@
-# sam3.cpp
+# InstructSAM
 
-C++ / ggml inference engine for **SAM 3** (Segment Anything Model 3). Runs on Metal, CUDA, Vulkan, and CPU.
+Natural-language image segmentation in native C++/ggml. Feed an image + a
+text prompt like `"Please segment 'box', 'person', 'forklift' in this image."`
+and get per-object mask PNGs plus a side-by-side overlay panel. CPU-only,
+end-to-end in ~1.7 min for a 640×426 input on a 12-core laptop.
 
-## Quickstart
-
-```bash
-# Build
-cmake -S . -B build && cmake --build build -j
-
-# Run (auto-downloads weights from HuggingFace on first use, no extra deps)
-python3 -c "
-import sam3cpp
-model = sam3cpp.Sam3Model('hf://rob-laz/sam3-gguf/sam3-image-f16.gguf')
-pred = model.predict('photo.jpg', 'person')
-print(f'{pred.count} detections')
-"
-```
-
-Or use the CLI tools directly with a local GGUF:
+## Quick start (Docker)
 
 ```bash
-./build/sam3-vision-trunk models/sam3-image-f16.gguf image.jpg output_prefix
+docker run --rm \
+  -v $PWD/images:/in \
+  -v $PWD/out:/out \
+  ghcr.io/smellslikeml/instructsam:latest \
+    --image /in/warehouse.jpg \
+    --query "Please segment 'box', 'person', 'forklift' in this image." \
+    --out-dir /out --run-vision
 ```
 
-## Pre-trained Weights
+Weights are converted from `CircleRadon/InstructSAM-2B` at Docker build
+time — no republishing. See `docker/Dockerfile` for the recipe.
 
-Available on HuggingFace: [rob-laz/sam3-gguf](https://huggingface.co/rob-laz/sam3-gguf)
+## Build from source
 
-| Variant | Size | Inference (M4 Max) |
-|---------|------|--------------------|
-| [`sam3-image-f32.gguf`](https://huggingface.co/rob-laz/sam3-gguf/resolve/main/sam3-image-f32.gguf) | 3.2 GB | 3.5s |
-| [`sam3-image-f16.gguf`](https://huggingface.co/rob-laz/sam3-gguf/resolve/main/sam3-image-f16.gguf) | 1.7 GB | 3.5s |
-| [`sam3-image-q8_0.gguf`](https://huggingface.co/rob-laz/sam3-gguf/resolve/main/sam3-image-q8_0.gguf) | 1.0 GB | 3.2s |
-
-The Python binding accepts `hf://rob-laz/sam3-gguf/<filename>` paths and will download + cache automatically (no extra dependencies — uses stdlib `urllib`).
-
-Based on [SAM 3](https://github.com/facebookresearch/sam3) by Meta FAIR.
-
-## Architecture
-
-- **Vision backbone**: 32-layer ViT with windowed + global attention (1008x1008 input)
-- **Text encoder**: CLIP-based language backbone
-- **Encoder fusion**: 6-layer transformer with self + cross-attention
-- **Decoder**: 6-layer transformer decoder with iterative box refinement
-- **Heads**: Grounding head (detection) + segmentation head (masks)
-
-## Building
+Requires a built llama.cpp checkout adjacent to this repo (`../llama.cpp/build/`
+must contain `libmtmd.a`, `libllama.a`, `libggml*.a`). See `docker/Dockerfile`
+for the exact llama.cpp commit and build flags we pin.
 
 ```bash
-cmake -S . -B build
-cmake --build build -j
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target instructsam -j
 ```
 
-Metal is enabled by default on macOS. All other GPU backends are disabled but can be toggled via CMake options.
+## What it does
 
-## Python Binding
+![InstructSAM architecture](assets/architecture.png)
 
-```bash
-uv pip install pybind11 scikit-build-core
-uv pip install -e bindings/python
+- Vision encoder + FPN neck extract dense multi-scale features from the input image
+- Qwen3-VL LM (via libmtmd) prefills the vision embeddings + user prompt with correct M-RoPE positions, then AR-decodes to emit `<|object_ref_start|>PHRASE<|object_ref_end|>` markers per requested object
+- Per-phrase mask-query injection at each `<|object_ref_end|>` boundary: 10 candidate mask hypotheses per phrase, extracted as hidden states from the LM
+- Detector decoder consumes those hypotheses as queries and produces refined per-slot mask logits
+- Score head selects the best slot per phrase; pixel decoder produces dense pixel masks that get upsampled to input resolution
+- CLI (`instructsam`) writes `pred_masks.f32`, per-object PNGs, and an overlay panel
 
-python3 -c "
-import sam3cpp
+See `docs/instructsam/` for the design notes and integration plan.
 
-# Auto-download F16 weights from HuggingFace
-model = sam3cpp.Sam3Model('hf://rob-laz/sam3-gguf/sam3-image-f16.gguf')
-pred = model.predict('photo.jpg', 'person')
+## Weights + sidecars
 
-# pred.scores, pred.boxes_xyxy, pred.masks are numpy arrays
-for i in range(pred.count):
-    print(f'score={pred.scores[i]:.3f} box={pred.boxes_xyxy[i]}')
+Four artifacts, all converted at Docker build time (or via
+`tools/pathb_convert_lm_mmproj.sh` + `tools/convert_instructsam_to_gguf.py`
++ `tools/extract_mask_queries.py` if building locally):
 
-# Overlay visualization
-overlay = sam3cpp.draw_overlay('photo.jpg', pred, mask_index=0)
-overlay.save('output.png')
-"
-```
+- `instructsam-lm-Q4_K_M.gguf` — quantized LM (~1.5 GB, default runtime)
+- `instructsam-lm-f16.gguf` — full-precision LM (~3.3 GB)
+- `instructsam-mmproj-f16.gguf` — vision projector (~780 MB)
+- `instructsam-grounding-f16.gguf` — DETR + FPN + mask decoder + scoring head (~1 GB)
+- `instructsam_mask_queries.f32` — learned mask-query template embeddings (~80 KB)
 
-## Rust Binding
+## Contributing
 
-```bash
-cd bindings/rust
-cargo build --example predict
-cargo run --example predict
-```
-
-## CLI Tools
-
-| Tool | Description |
-|------|-------------|
-| `sam3-inspect` | Report model metadata and tensor inventory |
-| `sam3-vision-trunk` | Run the ViT backbone on an image |
-| `sam3-call-image` | Produce the FPN pyramid from a trunk tensor |
-| `sam3-text-encode` | Encode text tokens |
-| `sam3-encoder-fusion` | Run the encoder fusion transformer |
-| `sam3-decoder` | Run the decoder with box refinement |
-| `sam3-grounding-head` | Produce detection boxes and logits |
-| `sam3-segmentation-head` | Produce segmentation masks |
-| `sam3-profile` | Run full pipeline with per-stage timing |
-
-All tools accept `--cpu` to force CPU execution. Default is GPU.
-
-## Converting Weights
-
-```bash
-python3 tools/convert_mlx_sam3_to_gguf.py \
-  --input models/mlx-sam3/model.safetensors \
-  --index models/mlx-sam3/model.safetensors.index.json \
-  --output models/sam3-image-f32.gguf
-
-# Quantize
-python3 tools/convert_mlx_sam3_to_gguf.py \
-  --input models/mlx-sam3/model.safetensors \
-  --index models/mlx-sam3/model.safetensors.index.json \
-  --output models/sam3-image-q8_0.gguf \
-  --quantize q8_0
-```
-
-## Performance
-
-End-to-end pipeline benchmark on Apple M4 Max (1008x1008 input, Metal GPU):
-
-| Stage | F32 | F16 | Q8_0 |
-|-------|-----|-----|------|
-| Vision trunk (32-layer ViT) | 1.9s | 2.1s | 1.8s |
-| Vision neck (FPN deconv) | 0.4s | 0.4s | 0.4s |
-| Text encoder | 0.2s | 0.1s | 0.1s |
-| Encoder fusion (6-layer) | 0.06s | 0.07s | 0.06s |
-| Decoder + heads | 0.8s | 0.8s | 0.8s |
-| **Total** | **3.5s** | **3.5s** | **3.2s** |
-
-Key GPU optimizations:
-- **Vision neck**: transposed convolution decomposed into matmul + pixel shuffle (was 166s with CPU-only `conv_transpose_2d`)
-- **Encoder fusion**: flash attention via `ggml_flash_attn_ext` (was 1.8s with materialized O(n²) score matrices)
-- **Segmentation head**: group norm with interleaved channels runs on GPU (was 0.6s on CPU)
-- **Vision trunk**: window partition/unpartition via reshape+permute (replaces CPU-only `ggml_win_part`)
+See [`REVIEW.md`](REVIEW.md) for review conventions and [`CONTRIBUTING.md`](CONTRIBUTING.md)
+for general contribution guidance.
 
 ## License
 
-Apache-2.0
+Apache-2.0. Weights derive from `CircleRadon/InstructSAM-2B` (upstream declares
+no explicit license); at-build-time conversion sidesteps redistribution.
+
+## Upstream + acknowledgements
+
+- **Depends on [llama.cpp](https://github.com/ggml-org/llama.cpp)** for the LM
+  half — specifically `libmtmd` for multimodal prefill (M-RoPE handling of image
+  tokens) and `libllama` for the KV cache + decode loop. The LM stage delegates
+  end-to-end to `mtmd_helper_eval_chunks` + `llama_decode`; native ggml is used
+  only for the vision path and the DETR mask chain.
+- **Forked from [ropoctl/sam3cpp](https://github.com/ropoctl/sam3cpp)** by
+  Robert Ó Callaghan — the vision encoder, FPN neck, and DETR structural code
+  originate there.
+- **InstructSAM paper + checkpoint**:
+  [CircleRadon/InstructSAM-2B](https://huggingface.co/CircleRadon/InstructSAM-2B).
+  Architecture figure above is reproduced from the InstructSAM paper.
