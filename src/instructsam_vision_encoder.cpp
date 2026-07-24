@@ -1,5 +1,6 @@
 #include "sam3/instructsam_vision_encoder.h"
 
+#include "sam3/detail/cpu_conv.h"
 #include "sam3/detail/cpu_linear.h"
 
 #include "ggml.h"
@@ -812,6 +813,34 @@ InstructsamVisionEncoder::FpnOutputs InstructsamVisionEncoder::run_neck(
 
     FpnOutputs out;
 
+    // Native ggml FPN neck. Each conv uses ggml_conv_2d (or transpose_2d)
+    // with pre-computed weights loaded once via get_f32. Bias adds are OMP
+    // loops after the conv to avoid the ggml_add-broadcast crash at large N.
+    auto convT_ks = [&](const std::vector<float> & x, int64_t Cin, int64_t H, int64_t W,
+                         int64_t Cout, const std::vector<float> & w,
+                         const std::vector<float> & b, int stride) {
+        return detail::ggml_conv_transpose2d_ks(x, Cin, H, W, Cout, /*KH=*/2, /*KW=*/2,
+                                                 GGML_TYPE_F32, w.data(), &b, stride);
+    };
+    auto conv1x1 = [&](const std::vector<float> & x, int64_t Cin, int64_t H, int64_t W,
+                        int64_t Cout, const std::vector<float> & w,
+                        const std::vector<float> & b) {
+        return detail::ggml_conv2d(x, Cin, H, W, Cout, /*KH=*/1, /*KW=*/1,
+                                    GGML_TYPE_F32, w.data(), &b, /*stride=*/1, /*pad=*/0);
+    };
+    auto conv3x3 = [&](const std::vector<float> & x, int64_t Cin, int64_t H, int64_t W,
+                        int64_t Cout, const std::vector<float> & w,
+                        const std::vector<float> & b) {
+        return detail::ggml_conv2d(x, Cin, H, W, Cout, /*KH=*/3, /*KW=*/3,
+                                    GGML_TYPE_F32, w.data(), &b, /*stride=*/1, /*pad=*/1);
+    };
+    auto gelu_inplace = [](std::vector<float> & v) {
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < static_cast<int64_t>(v.size()); ++i) {
+            v[i] = 0.5f * v[i] * (1.0f + std::erf(v[i] / std::sqrt(2.0f)));
+        }
+    };
+
     // ── FPN layer 0 (scale=4×): ConvT(1024→512) → GELU → ConvT(512→256)
     //                            → proj1 Conv1x1(256→256) → proj2 Conv3x3(256→256) ─
     {
@@ -825,13 +854,11 @@ InstructsamVisionEncoder::FpnOutputs InstructsamVisionEncoder::run_neck(
         const auto p2_w  = get_f32(p + ".proj2.weight",          256 * 256 * 9);
         const auto p2_b  = get_f32(p + ".proj2.bias",            256);
 
-        auto t = cpu_conv_transpose2d_k2s2(hs, 1024, kGridSize, kGridSize, 512, sl0_w, sl0_b);
-        // t is now [512, 144, 144]
-        cpu_gelu(t);
-        t = cpu_conv_transpose2d_k2s2(t, 512, kGridSize * 2, kGridSize * 2, 256, sl2_w, sl2_b);
-        // t is now [256, 288, 288]
-        t = cpu_conv2d_1x1(t, 256, kGridSize * 4, kGridSize * 4, 256, p1_w, p1_b);
-        out.bb0 = cpu_conv2d_3x3(t, 256, kGridSize * 4, kGridSize * 4, 256, p2_w, p2_b);
+        auto t = convT_ks(hs, 1024, kGridSize, kGridSize, 512, sl0_w, sl0_b, 2);
+        gelu_inplace(t);
+        t = convT_ks(t, 512, kGridSize * 2, kGridSize * 2, 256, sl2_w, sl2_b, 2);
+        t = conv1x1(t, 256, kGridSize * 4, kGridSize * 4, 256, p1_w, p1_b);
+        out.bb0 = conv3x3(t, 256, kGridSize * 4, kGridSize * 4, 256, p2_w, p2_b);
     }
 
     // ── FPN layer 1 (scale=2×): ConvT(1024→512) → proj1 (512→256) → proj2 (256→256) ─
@@ -844,9 +871,9 @@ InstructsamVisionEncoder::FpnOutputs InstructsamVisionEncoder::run_neck(
         const auto p2_w  = get_f32(p + ".proj2.weight",          256 * 256 * 9);
         const auto p2_b  = get_f32(p + ".proj2.bias",            256);
 
-        auto t = cpu_conv_transpose2d_k2s2(hs, 1024, kGridSize, kGridSize, 512, sl0_w, sl0_b);
-        t = cpu_conv2d_1x1(t, 512, kGridSize * 2, kGridSize * 2, 256, p1_w, p1_b);
-        out.bb1 = cpu_conv2d_3x3(t, 256, kGridSize * 2, kGridSize * 2, 256, p2_w, p2_b);
+        auto t = convT_ks(hs, 1024, kGridSize, kGridSize, 512, sl0_w, sl0_b, 2);
+        t = conv1x1(t, 512, kGridSize * 2, kGridSize * 2, 256, p1_w, p1_b);
+        out.bb1 = conv3x3(t, 256, kGridSize * 2, kGridSize * 2, 256, p2_w, p2_b);
     }
 
     // ── FPN layer 2 (scale=1×): proj1 (1024→256) → proj2 (256→256) ────────
@@ -857,8 +884,8 @@ InstructsamVisionEncoder::FpnOutputs InstructsamVisionEncoder::run_neck(
         const auto p2_w  = get_f32(p + ".proj2.weight", 256 * 256 * 9);
         const auto p2_b  = get_f32(p + ".proj2.bias",   256);
 
-        auto t = cpu_conv2d_1x1(hs, 1024, kGridSize, kGridSize, 256, p1_w, p1_b);
-        out.bb2 = cpu_conv2d_3x3(t, 256, kGridSize, kGridSize, 256, p2_w, p2_b);
+        auto t = conv1x1(hs, 1024, kGridSize, kGridSize, 256, p1_w, p1_b);
+        out.bb2 = conv3x3(t, 256, kGridSize, kGridSize, 256, p2_w, p2_b);
     }
 
     return out;
