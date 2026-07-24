@@ -39,6 +39,12 @@ public:
     // Detokenize a run of tokens back to a UTF-8 string (special tokens rendered).
     std::string detokenize(const std::vector<int32_t> & tokens) const;
 
+    // BPE-tokenize a raw text string with no chat template applied and no
+    // BOS/EOS added. Used by the CLI to tokenize per-phrase strings like
+    // "pallet jack" the same way they appear inside <|object_ref_start|>…
+    // <|object_ref_end|> — no leading space, no special token parsing.
+    std::vector<int32_t> tokenize_raw(const std::string & text) const;
+
     // Special-token IDs cached at load time.
     struct SpecialTokens {
         int32_t im_start;          // <|im_start|>

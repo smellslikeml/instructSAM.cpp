@@ -112,4 +112,19 @@ std::string InstructsamTokenizer::detokenize(const std::vector<int32_t> & tokens
     return s;
 }
 
+std::vector<int32_t> InstructsamTokenizer::tokenize_raw(const std::string & text) const {
+    std::vector<llama_token> buf(text.size() + 16, 0);
+    int32_t n = llama_tokenize(vocab_, text.c_str(), static_cast<int32_t>(text.size()),
+                               buf.data(), static_cast<int32_t>(buf.size()),
+                               /*add_special=*/false, /*parse_special=*/false);
+    if (n < 0) {
+        buf.assign(static_cast<size_t>(-n), 0);
+        n = llama_tokenize(vocab_, text.c_str(), static_cast<int32_t>(text.size()),
+                           buf.data(), static_cast<int32_t>(buf.size()),
+                           false, false);
+    }
+    if (n < 0) throw std::runtime_error("llama_tokenize failed");
+    return std::vector<int32_t>(buf.begin(), buf.begin() + n);
+}
+
 }  // namespace sam3

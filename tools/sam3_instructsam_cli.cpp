@@ -419,14 +419,12 @@ int main(int argc, char ** argv) {
                          std::chrono::steady_clock::now() - tpref).count() << "s\n";
 
         // Standalone-context BPE tokens (as they appear inside
-        // <|object_ref_start|>…<|object_ref_end|>), verified against captured
-        // text_output.txt from InstructSAM PyTorch inference.
+        // <|object_ref_start|>…<|object_ref_end|>). Uses our llama.cpp
+        // tokenizer wrapper with parse_special=false and add_special=false —
+        // matches how InstructSAM's LM emits phrase tokens between the
+        // ref_start/ref_end markers.
         auto tokenize_phrase = [&](const std::string & p) -> std::vector<int32_t> {
-            if (p == "box")      return {2011};
-            if (p == "person")   return {8987};
-            if (p == "shelf")    return {53950};
-            if (p == "forklift") return {44738, 34969};  // "fork" + "lift"
-            throw std::runtime_error("phrase not in built-in map: " + p);
+            return tokz->tokenize_raw(p);
         };
 
         // ── Free-form generation branch ─────────────────────────────────
@@ -510,12 +508,8 @@ int main(int argc, char ** argv) {
     // (vision_pos, init_refs, qpos_L0) are per-vision-shape/per-decoder
     // constants that don't depend on the LM output — they'll come from the
     // grounding GGUF once wired directly.
-    auto tokenize_phrase_for_text = [](const std::string & p) -> std::vector<int32_t> {
-        if (p == "box")      return {2011};
-        if (p == "person")   return {8987};
-        if (p == "shelf")    return {53950};
-        if (p == "forklift") return {44738, 34969};
-        throw std::runtime_error("phrase not in built-in map: " + p);
+    auto tokenize_phrase_for_text = [&](const std::string & p) -> std::vector<int32_t> {
+        return tokz->tokenize_raw(p);
     };
     constexpr int64_t kPhraseH = 2048;
     constexpr int64_t kPhraseMax = 32;
