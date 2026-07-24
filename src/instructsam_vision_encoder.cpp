@@ -611,6 +611,19 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
         } else throw std::runtime_error("run_layer: unsupported dtype");
         return v;
     };
+    // Same pattern as the LM: matmul weights are F16 in the GGUF, so read
+    // them AS F16 straight through — ggml_mul_mat's F16×F32 SIMD kernel
+    // does the dequant per-lane and halves the weight-streaming bandwidth
+    // vs get_f32.
+    auto get_f16_raw = [&](const std::string & name, size_t n) {
+        ggml_tensor * t = require_tensor(model_, name);
+        if (t->type != GGML_TYPE_F16) {
+            throw std::runtime_error("get_f16_raw: expected F16 for " + name);
+        }
+        std::vector<ggml_fp16_t> v(n);
+        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(ggml_fp16_t));
+        return v;
+    };
 
     const auto ln1_w = get_f32(p + ".layer_norm1.weight", kHiddenSize);
     const auto ln1_b = get_f32(p + ".layer_norm1.bias",   kHiddenSize);
@@ -650,13 +663,13 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
         ? ln1_out
         : cpu_window_partition(ln1_out, kGridSize, kGridSize, win);
 
-    const auto qw = get_f32(p + ".attention.q_proj.weight", kHiddenSize * kHiddenSize);
+    const auto qw = get_f16_raw(p + ".attention.q_proj.weight", kHiddenSize * kHiddenSize);
     const auto qb = get_f32(p + ".attention.q_proj.bias",   kHiddenSize);
-    const auto kw = get_f32(p + ".attention.k_proj.weight", kHiddenSize * kHiddenSize);
+    const auto kw = get_f16_raw(p + ".attention.k_proj.weight", kHiddenSize * kHiddenSize);
     const auto kb = get_f32(p + ".attention.k_proj.bias",   kHiddenSize);
-    const auto vw = get_f32(p + ".attention.v_proj.weight", kHiddenSize * kHiddenSize);
+    const auto vw = get_f16_raw(p + ".attention.v_proj.weight", kHiddenSize * kHiddenSize);
     const auto vb = get_f32(p + ".attention.v_proj.bias",   kHiddenSize);
-    const auto ow = get_f32(p + ".attention.o_proj.weight", kHiddenSize * kHiddenSize);
+    const auto ow = get_f16_raw(p + ".attention.o_proj.weight", kHiddenSize * kHiddenSize);
     const auto ob = get_f32(p + ".attention.o_proj.bias",   kHiddenSize);
 
     using detail::cpu_linear;
@@ -741,10 +754,10 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
 
     const std::vector<float> ln2_out = cpu_ln(attn_unwin, kNumPatches, kHiddenSize, ln2_w, ln2_b);
 
-    const auto fc1_w = get_f32(p + ".mlp.fc1.weight", kMlpDim * kHiddenSize);
-    const auto fc1_b = get_f32(p + ".mlp.fc1.bias",   kMlpDim);
-    const auto fc2_w = get_f32(p + ".mlp.fc2.weight", kHiddenSize * kMlpDim);
-    const auto fc2_b = get_f32(p + ".mlp.fc2.bias",   kHiddenSize);
+    const auto fc1_w = get_f16_raw(p + ".mlp.fc1.weight", kMlpDim * kHiddenSize);
+    const auto fc1_b = get_f32    (p + ".mlp.fc1.bias",   kMlpDim);
+    const auto fc2_w = get_f16_raw(p + ".mlp.fc2.weight", kHiddenSize * kMlpDim);
+    const auto fc2_b = get_f32    (p + ".mlp.fc2.bias",   kHiddenSize);
 
     auto mlp_mid = cpu_linear(ln2_out, kNumPatches, kHiddenSize, kMlpDim, fc1_w, nullptr);
     for (int64_t n = 0; n < kNumPatches; ++n)
