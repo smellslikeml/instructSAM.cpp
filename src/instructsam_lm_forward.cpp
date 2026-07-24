@@ -405,4 +405,56 @@ std::vector<float> InstructsamLmForward::extract_seg_output_embeddings(
     return seg_out;
 }
 
+std::vector<float> InstructsamLmForward::extract_seg_output_embeddings_from_prefix(
+    const std::vector<float> & prefix_embeds,
+    int64_t n_prefix,
+    const std::vector<float> & mask_queries,
+    const std::vector<float> & mask_start_embed,
+    const std::vector<float> & mask_end_embed
+) const {
+    if (mask_queries.size() != 10 * kHiddenSize) {
+        throw std::runtime_error("from_prefix: mask_queries must be [10, 2048]");
+    }
+    if (mask_start_embed.size() != kHiddenSize || mask_end_embed.size() != kHiddenSize) {
+        throw std::runtime_error("from_prefix: mask_start/end must be [2048]");
+    }
+    if (n_prefix <= 0 || static_cast<size_t>(n_prefix) * kHiddenSize != prefix_embeds.size()) {
+        throw std::runtime_error("from_prefix: prefix_embeds shape mismatch");
+    }
+
+    const int64_t n_inject = 12;  // mask_start + 10 mask_queries + mask_end
+    const int64_t seq_len = n_prefix + n_inject;
+    std::vector<float> embeds(seq_len * kHiddenSize);
+    std::vector<int32_t> positions(seq_len);
+
+    // Splice prefix (LM-space embeds, may include image embeddings)
+    std::memcpy(embeds.data(), prefix_embeds.data(),
+                static_cast<size_t>(n_prefix) * kHiddenSize * sizeof(float));
+    for (int64_t i = 0; i < n_prefix; ++i) positions[i] = static_cast<int32_t>(i);
+
+    std::memcpy(embeds.data() + n_prefix * kHiddenSize,
+                mask_start_embed.data(), kHiddenSize * sizeof(float));
+    positions[n_prefix] = static_cast<int32_t>(n_prefix);
+
+    for (int64_t j = 0; j < 10; ++j) {
+        std::memcpy(embeds.data() + (n_prefix + 1 + j) * kHiddenSize,
+                    mask_queries.data() + j * kHiddenSize,
+                    kHiddenSize * sizeof(float));
+        positions[n_prefix + 1 + j] = static_cast<int32_t>(n_prefix + 1 + j);
+    }
+
+    std::memcpy(embeds.data() + (n_prefix + 11) * kHiddenSize,
+                mask_end_embed.data(), kHiddenSize * sizeof(float));
+    positions[n_prefix + 11] = static_cast<int32_t>(n_prefix + 11);
+
+    const auto final_hidden = run(embeds, seq_len, positions);
+    std::vector<float> seg_out(10 * kHiddenSize);
+    for (int64_t j = 0; j < 10; ++j) {
+        std::memcpy(seg_out.data() + j * kHiddenSize,
+                    final_hidden.data() + (n_prefix + 1 + j) * kHiddenSize,
+                    kHiddenSize * sizeof(float));
+    }
+    return seg_out;
+}
+
 }  // namespace sam3

@@ -85,6 +85,7 @@ add_library(sam3cpp
     src/instructsam_detr_encoder.cpp
     src/instructsam_lm_bridge.cpp
     src/instructsam_lm_forward.cpp
+    src/instructsam_preprocess.cpp
     src/instructsam_vision_encoder.cpp
     src/instructsam_lm_runner.cpp
     src/encoder_fusion.cpp
@@ -103,6 +104,7 @@ target_include_directories(sam3cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/examples
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
 )
 
 target_link_libraries(sam3cpp
@@ -127,6 +129,7 @@ add_library(sam3cpp_static STATIC
     src/instructsam_detr_encoder.cpp
     src/instructsam_lm_bridge.cpp
     src/instructsam_lm_forward.cpp
+    src/instructsam_preprocess.cpp
     src/instructsam_vision_encoder.cpp
     src/instructsam_lm_runner.cpp
     src/encoder_fusion.cpp
@@ -240,6 +243,9 @@ target_link_libraries(sam3-instructsam-vision-neck-test PRIVATE sam3cpp)
 add_executable(sam3-instructsam-vision-native-e2e tools/sam3_instructsam_vision_native_e2e.cpp)
 target_link_libraries(sam3-instructsam-vision-native-e2e PRIVATE sam3cpp)
 
+add_executable(sam3-instructsam-preprocess-test tools/sam3_instructsam_preprocess_test.cpp)
+target_link_libraries(sam3-instructsam-preprocess-test PRIVATE sam3cpp)
+
 # ── Piece 3: LM integration via llama.cpp ────────────────────────────────
 # Links against Path B's pre-built llama.cpp (in scratchpad/llama.cpp/build).
 # Only enabled if the build directory exists.
@@ -259,6 +265,95 @@ if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
     # ggml-cpu contains backend init code that would be dropped without a
     # direct reference — force-link via --whole-archive.
     target_link_libraries(sam3-instructsam-llama-probe PRIVATE
+        "${LLAMA_CPP_ROOT}/build/src/libllama.a"
+        "-Wl,--whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-cpu.a"
+        "-Wl,--no-whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml.a"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-base.a"
+        Threads::Threads
+        OpenMP::OpenMP_CXX
+        m dl)
+
+    # Piece 6 / Day 9a — Qwen3-VL tokenizer wrapper around llama.cpp.
+    # Compiled here (not in the base sam3cpp library) so downstream
+    # binaries that don't need llama.cpp still link cleanly.
+    add_library(sam3cpp_llama_tokenizer STATIC src/instructsam_tokenizer.cpp)
+    target_include_directories(sam3cpp_llama_tokenizer PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        "${LLAMA_CPP_ROOT}/include"
+        "${LLAMA_CPP_ROOT}/ggml/include")
+
+    add_executable(sam3-instructsam-tokenizer-test tools/sam3_instructsam_tokenizer_test.cpp)
+    target_include_directories(sam3-instructsam-tokenizer-test PRIVATE
+        "${LLAMA_CPP_ROOT}/include")
+    target_link_libraries(sam3-instructsam-tokenizer-test PRIVATE
+        sam3cpp_llama_tokenizer
+        "${LLAMA_CPP_ROOT}/build/src/libllama.a"
+        "-Wl,--whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-cpu.a"
+        "-Wl,--no-whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml.a"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-base.a"
+        Threads::Threads
+        OpenMP::OpenMP_CXX
+        m dl)
+
+    # Day 9b — mmproj (Qwen3-VL vision→LM embedding) wrapper around libmtmd.
+    add_library(sam3cpp_mmproj STATIC src/instructsam_mmproj.cpp)
+    target_include_directories(sam3cpp_mmproj PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        "${LLAMA_CPP_ROOT}/include"
+        "${LLAMA_CPP_ROOT}/ggml/include"
+        "${LLAMA_CPP_ROOT}/tools/mtmd")
+
+    add_executable(sam3-instructsam-mmproj-test tools/sam3_instructsam_mmproj_test.cpp)
+    target_include_directories(sam3-instructsam-mmproj-test PRIVATE
+        "${LLAMA_CPP_ROOT}/include"
+        "${LLAMA_CPP_ROOT}/tools/mtmd")
+    target_link_libraries(sam3-instructsam-mmproj-test PRIVATE
+        sam3cpp_mmproj
+        "${LLAMA_CPP_ROOT}/build/tools/mtmd/libmtmd.a"
+        "${LLAMA_CPP_ROOT}/build/src/libllama.a"
+        "-Wl,--whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-cpu.a"
+        "-Wl,--no-whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml.a"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-base.a"
+        Threads::Threads
+        OpenMP::OpenMP_CXX
+        m dl)
+
+    # Day 9c — LM forward + real image context test
+    add_executable(sam3-instructsam-lm-with-image-test tools/sam3_instructsam_lm_with_image_test.cpp)
+    target_include_directories(sam3-instructsam-lm-with-image-test PRIVATE
+        "${LLAMA_CPP_ROOT}/include"
+        "${LLAMA_CPP_ROOT}/tools/mtmd")
+    target_link_libraries(sam3-instructsam-lm-with-image-test PRIVATE
+        sam3cpp
+        sam3cpp_llama_tokenizer
+        sam3cpp_mmproj
+        "${LLAMA_CPP_ROOT}/build/tools/mtmd/libmtmd.a"
+        "${LLAMA_CPP_ROOT}/build/src/libllama.a"
+        "-Wl,--whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-cpu.a"
+        "-Wl,--no-whole-archive"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml.a"
+        "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-base.a"
+        Threads::Threads
+        OpenMP::OpenMP_CXX
+        m dl)
+
+    # Day 9d — end-to-end CLI
+    add_executable(sam3-instructsam-cli tools/sam3_instructsam_cli.cpp)
+    target_include_directories(sam3-instructsam-cli PRIVATE
+        "${LLAMA_CPP_ROOT}/include"
+        "${LLAMA_CPP_ROOT}/tools/mtmd")
+    target_link_libraries(sam3-instructsam-cli PRIVATE
+        sam3cpp
+        sam3cpp_llama_tokenizer
+        sam3cpp_mmproj
+        "${LLAMA_CPP_ROOT}/build/tools/mtmd/libmtmd.a"
         "${LLAMA_CPP_ROOT}/build/src/libllama.a"
         "-Wl,--whole-archive"
         "${LLAMA_CPP_ROOT}/build/ggml/src/libggml-cpu.a"

@@ -89,6 +89,19 @@ public:
         const std::vector<float> & mask_end_embed       // [2048]
     ) const;
 
+    // Same as above, but takes a raw prefix of LM-space embeddings
+    // (rather than token IDs). Use this when the prefix contains image
+    // embeddings from mmproj that don't correspond to any single token —
+    // caller stitches [text_embeds, image_embeds, text_embeds] and passes
+    // the whole thing here.
+    std::vector<float> extract_seg_output_embeddings_from_prefix(
+        const std::vector<float> & prefix_embeds,       // [n_prefix, 2048]
+        int64_t n_prefix,
+        const std::vector<float> & mask_queries,        // [10, 2048]
+        const std::vector<float> & mask_start_embed,    // [2048]
+        const std::vector<float> & mask_end_embed       // [2048]
+    ) const;
+
     // Look up a token's INPUT embedding from token_embd.weight.
     // Handy for building the phrase_embeddings input to text_hidden_fcs
     // (piece 4b). Also for constructing the initial embed sequence in the
