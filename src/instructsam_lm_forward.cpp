@@ -49,6 +49,18 @@ std::vector<float> get_f32(const GgufModel & model, const std::string & name, si
     return v;
 }
 
+// Read a weight tensor as raw F16 (throws if not F16). Half the bytes vs
+// get_f32, no per-element dequant — ggml's mul_mat kernel does that in-SIMD.
+std::vector<ggml_fp16_t> get_f16(const GgufModel & model, const std::string & name, size_t n) {
+    ggml_tensor * t = require_tensor(model, name);
+    if (t->type != GGML_TYPE_F16) {
+        throw std::runtime_error("get_f16: expected F16 tensor for " + name);
+    }
+    std::vector<ggml_fp16_t> v(n);
+    ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(ggml_fp16_t));
+    return v;
+}
+
 // ── CPU primitives ──────────────────────────────────────────────────────
 
 // RMSNorm on [N, D] with per-D weight vector [D].
@@ -92,31 +104,33 @@ int lm_ggml_threads() {
 // pthread pool, so this is 10-20× faster than the OMP+auto-vectorized
 // scalar loop at large sizes. Setup/teardown overhead is ~20 µs per call,
 // which is negligible for our 2048-dim projections and 6144-dim MLP.
-std::vector<float> cpu_linear(
+// Core: y = mul_mat(w_typed, x_f32) via ggml. Weight tensor has the given
+// ggml type + data pointer; ggml auto-selects the right kernel (F16→F32,
+// Q4_K→F32 etc.) with SIMD dequant on the fly.
+std::vector<float> cpu_linear_impl(
     const std::vector<float> & x, int64_t N, int64_t D_in, int64_t D_out,
-    const std::vector<float> & w,
+    ggml_type w_type, const void * w_data,
     const std::vector<float> * b = nullptr
 ) {
-    // Only need context space for tensor metadata + graph — data lives in
-    // the caller's std::vector via ->data pointer aliasing (no_alloc).
-    // Output is a fresh vector that we point yt at BEFORE compute.
-    const size_t ctx_bytes = ggml_tensor_overhead() * 16
-                             + ggml_graph_overhead()
-                             + 4096;
+    // ggml graph_compute needs a work buffer proportional to output size
+    // (partial results held temporarily). Empirically observed:
+    //   ~166 KB at N=15  → linear in N × D_out.
+    // Scale conservatively with a 512 KB floor.
+    const size_t out_bytes = static_cast<size_t>(N * D_out * 4);
+    const size_t ctx_bytes = std::max<size_t>(512 * 1024, 8 * out_bytes + 512 * 1024);
     std::vector<uint8_t> ctx_mem(ctx_bytes);
     ggml_init_params params { ctx_bytes, ctx_mem.data(), /*no_alloc=*/true };
     ggml_context * ctx = ggml_init(params);
     if (!ctx) throw std::runtime_error("cpu_linear: ggml_init failed");
 
     ggml_tensor * xt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_in, N);
-    ggml_tensor * wt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_in, D_out);
+    ggml_tensor * wt = ggml_new_tensor_2d(ctx, w_type,        D_in, D_out);
     xt->data = const_cast<float *>(x.data());
-    wt->data = const_cast<float *>(w.data());
+    wt->data = const_cast<void *>(w_data);
 
     ggml_tensor * yt = ggml_mul_mat(ctx, wt, xt);
-    ggml_tensor * bt = nullptr;
     if (b) {
-        bt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D_out);
+        ggml_tensor * bt = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D_out);
         bt->data = const_cast<float *>(b->data());
         yt = ggml_add(ctx, yt, bt);
     }
@@ -124,12 +138,32 @@ std::vector<float> cpu_linear(
     std::vector<float> y(static_cast<size_t>(N * D_out));
     yt->data = y.data();
 
-    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 8, false);
     ggml_build_forward_expand(graph, yt);
     ggml_graph_compute_with_ctx(ctx, graph, lm_ggml_threads());
 
     ggml_free(ctx);
     return y;
+}
+
+// F32 weight overload (used by old run() codepath).
+std::vector<float> cpu_linear(
+    const std::vector<float> & x, int64_t N, int64_t D_in, int64_t D_out,
+    const std::vector<float> & w,
+    const std::vector<float> * b = nullptr
+) {
+    return cpu_linear_impl(x, N, D_in, D_out, GGML_TYPE_F32, w.data(), b);
+}
+
+// F16 weight overload — used by the layer_forward / KV-cache path.
+// Weight stays as F16 in memory (halves streaming bandwidth vs F32) and
+// ggml's mul_mat kernel does F16→F32 dequant per SIMD lane.
+std::vector<float> cpu_linear(
+    const std::vector<float> & x, int64_t N, int64_t D_in, int64_t D_out,
+    const std::vector<ggml_fp16_t> & w,
+    const std::vector<float> * b = nullptr
+) {
+    return cpu_linear_impl(x, N, D_in, D_out, GGML_TYPE_F16, w.data(), b);
 }
 
 // SwiGLU: silu(gate) * up, then down_proj.
@@ -180,26 +214,29 @@ void cpu_rope_1d_half(
 }
 
 // ── Per-layer weights bundle (loaded once per layer per forward) ────────
+// Norms stay F32 (they are F32 in the GGUF). Matmul weights kept AS F16
+// straight from the GGUF — no dequant on load; ggml's mul_mat does F16→F32
+// SIMD dequant per lane at compute time, halving weight-streaming bandwidth.
 struct LayerWeights {
-    std::vector<float> attn_norm_w, attn_q_w, attn_k_w, attn_v_w, attn_o_w;
-    std::vector<float> q_norm_w, k_norm_w;
-    std::vector<float> ffn_norm_w, ffn_gate_w, ffn_up_w, ffn_down_w;
+    std::vector<float>        attn_norm_w, ffn_norm_w, q_norm_w, k_norm_w;
+    std::vector<ggml_fp16_t>  attn_q_w, attn_k_w, attn_v_w, attn_o_w;
+    std::vector<ggml_fp16_t>  ffn_gate_w, ffn_up_w, ffn_down_w;
 };
 
 LayerWeights load_layer_weights(const GgufModel & model, int layer) {
     const std::string p = "blk." + std::to_string(layer);
     LayerWeights w;
     w.attn_norm_w = get_f32(model, p + ".attn_norm.weight",   kHiddenSize);
-    w.attn_q_w    = get_f32(model, p + ".attn_q.weight",      kHiddenSize * kHiddenSize);
-    w.attn_k_w    = get_f32(model, p + ".attn_k.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
-    w.attn_v_w    = get_f32(model, p + ".attn_v.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
-    w.attn_o_w    = get_f32(model, p + ".attn_output.weight", kHiddenSize * kHiddenSize);
+    w.attn_q_w    = get_f16(model, p + ".attn_q.weight",      kHiddenSize * kHiddenSize);
+    w.attn_k_w    = get_f16(model, p + ".attn_k.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
+    w.attn_v_w    = get_f16(model, p + ".attn_v.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
+    w.attn_o_w    = get_f16(model, p + ".attn_output.weight", kHiddenSize * kHiddenSize);
     w.q_norm_w    = get_f32(model, p + ".attn_q_norm.weight", kHeadDim);
     w.k_norm_w    = get_f32(model, p + ".attn_k_norm.weight", kHeadDim);
     w.ffn_norm_w  = get_f32(model, p + ".ffn_norm.weight",    kHiddenSize);
-    w.ffn_gate_w  = get_f32(model, p + ".ffn_gate.weight",    kIntermediate * kHiddenSize);
-    w.ffn_up_w    = get_f32(model, p + ".ffn_up.weight",      kIntermediate * kHiddenSize);
-    w.ffn_down_w  = get_f32(model, p + ".ffn_down.weight",    kHiddenSize * kIntermediate);
+    w.ffn_gate_w  = get_f16(model, p + ".ffn_gate.weight",    kIntermediate * kHiddenSize);
+    w.ffn_up_w    = get_f16(model, p + ".ffn_up.weight",      kIntermediate * kHiddenSize);
+    w.ffn_down_w  = get_f16(model, p + ".ffn_down.weight",    kHiddenSize * kIntermediate);
     return w;
 }
 
