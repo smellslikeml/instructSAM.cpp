@@ -68,12 +68,13 @@ int32_t InstructsamTokenizer::vocab_size() const {
 }
 
 std::vector<int32_t> InstructsamTokenizer::tokenize_chat(const std::string & user_query) const {
-    // InstructSAM ChatML variant. We hand-roll rather than using
-    // llama_chat_apply_template because the built-in "chatml" template
-    // does not inject the <|vision_start|><|image_pad|><|vision_end|>
-    // block InstructSAM's Qwen3-VL front-end expects.
+    // InstructSAM's Qwen3-VL front-end renders WITHOUT a system message
+    // (verified against transformers apply_chat_template on the shipped
+    // tokenizer). Adding "You are a helpful assistant" makes the LM
+    // route to describe/OCR mode instead of emitting <|object_ref_start|>
+    // segmentation markers, because that system-turn was never in
+    // training data.
     const std::string prompt =
-        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         "<|im_start|>user\n"
         "<|vision_start|><|image_pad|><|vision_end|>" + user_query +
         "<|im_end|>\n"

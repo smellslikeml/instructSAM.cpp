@@ -388,7 +388,9 @@ if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
     add_executable(sam3-instructsam-cli tools/sam3_instructsam_cli.cpp)
     target_include_directories(sam3-instructsam-cli PRIVATE
         "${LLAMA_CPP_ROOT}/include"
-        "${LLAMA_CPP_ROOT}/tools/mtmd")
+        "${LLAMA_CPP_ROOT}/tools/mtmd"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"                    # stb_image.h
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/examples")         # stb_image_write.h
     target_link_libraries(sam3-instructsam-cli PRIVATE
         sam3cpp
         sam3cpp_llama_tokenizer
@@ -403,6 +405,12 @@ if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
         Threads::Threads
         OpenMP::OpenMP_CXX
         m dl)
+    # Both sam3cpp/pipeline.cpp AND libmtmd/mtmd-helper.cpp include
+    # STB_IMAGE_IMPLEMENTATION. As long as we only reference stbi_load /
+    # stbi_image_free (not the 16-bit variants that specifically collide),
+    # letting the linker keep the first-seen definition is safe.
+    target_link_options(sam3-instructsam-cli PRIVATE
+        "LINKER:--allow-multiple-definition")
 else()
     message(STATUS "llama.cpp build not found at ${LLAMA_CPP_ROOT}/build — skipping Piece 3 targets")
 endif()

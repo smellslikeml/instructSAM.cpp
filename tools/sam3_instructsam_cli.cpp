@@ -36,6 +36,18 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+// stb_image_write for output PNGs — implementation lives in this TU.
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+// stb_image itself is already linked from sam3cpp (via pipeline.cpp) and
+// libmtmd.a, so we can't include stb_image.h here without a double
+// definition of stbi_*. Forward-declare just the two symbols we need.
+extern "C" {
+unsigned char * stbi_load(const char *, int *, int *, int *, int);
+void            stbi_image_free(void *);
+}
+
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -125,8 +137,99 @@ std::vector<float> cpu_layer_norm(
     return out;
 }
 
-// Very simple PNG writer via stb_image_write (vendored alongside stb_image.h).
-// For --output PNGs. Skipped if stb_image_write not vendored.
+// ── Mask upsampling + PNG output ────────────────────────────────────────
+
+// Sigmoid + bilinear resize a [288, 288] mask logit tensor to the input
+// image size, then threshold at 0.5. Returns 8-bit binary mask [H*W].
+inline std::vector<uint8_t> mask_logits_to_binary(
+    const std::vector<float> & logits_288, int Hout, int Wout
+) {
+    constexpr int Msrc = 288;
+    // Sigmoid to [0,1] on 288×288
+    std::vector<float> p(Msrc * Msrc);
+    for (int i = 0; i < Msrc * Msrc; ++i) p[i] = 1.0f / (1.0f + std::exp(-logits_288[i]));
+    // Bilinear resize [Msrc,Msrc] → [Hout, Wout]. Uses PIL-convention centering.
+    std::vector<uint8_t> out(Hout * Wout);
+    const double sy = static_cast<double>(Msrc) / Hout;
+    const double sx = static_cast<double>(Msrc) / Wout;
+    for (int y = 0; y < Hout; ++y) {
+        const double cy = (y + 0.5) * sy - 0.5;
+        const int y0 = std::max(0, std::min(Msrc - 1, static_cast<int>(std::floor(cy))));
+        const int y1 = std::min(Msrc - 1, y0 + 1);
+        const double fy = cy - y0;
+        for (int x = 0; x < Wout; ++x) {
+            const double cx = (x + 0.5) * sx - 0.5;
+            const int x0 = std::max(0, std::min(Msrc - 1, static_cast<int>(std::floor(cx))));
+            const int x1 = std::min(Msrc - 1, x0 + 1);
+            const double fx = cx - x0;
+            const double a = p[y0 * Msrc + x0], b = p[y0 * Msrc + x1];
+            const double c = p[y1 * Msrc + x0], d = p[y1 * Msrc + x1];
+            const double v = a * (1-fy) * (1-fx) + b * (1-fy) * fx
+                           + c * fy     * (1-fx) + d * fy     * fx;
+            out[y * Wout + x] = (v > 0.5) ? 255 : 0;
+        }
+    }
+    return out;
+}
+
+// Palette for overlay panel — 12 distinct colors, same order as the viz
+// script so overlay-panel visuals stay comparable across paths.
+constexpr uint8_t kPalette[12][3] = {
+    {255,  80,  80}, { 80, 200,  80}, { 80, 140, 255}, {255, 200,  60},
+    {200,  80, 200}, { 80, 220, 220}, {255, 140,  80}, {140,  80, 220},
+    {120, 220,  80}, {220, 120, 120}, { 80, 100, 200}, {200, 200,  80},
+};
+
+// Compose an [orig | tinted-overlay] side-by-side RGB image and write it
+// as PNG. rgb is [H*W*3] uint8. masks_bin is a list of [H*W] uint8 (0/255).
+inline void write_overlay_panel(
+    const std::string & path,
+    const uint8_t * rgb, int W, int H,
+    const std::vector<std::vector<uint8_t>> & masks_bin,
+    const std::vector<std::string> & labels
+) {
+    const int panelW = W * 2;
+    std::vector<uint8_t> panel(panelW * H * 3);
+    // Left half: original
+    for (int y = 0; y < H; ++y) {
+        std::memcpy(panel.data() + y * panelW * 3, rgb + y * W * 3, W * 3);
+    }
+    // Right half: tinted overlay, alpha=0.5
+    constexpr float kAlpha = 0.5f;
+    for (int y = 0; y < H; ++y) {
+        const uint8_t * src = rgb + y * W * 3;
+        uint8_t * dst = panel.data() + (y * panelW + W) * 3;
+        std::memcpy(dst, src, W * 3);
+        for (size_t k = 0; k < masks_bin.size(); ++k) {
+            const uint8_t * m = masks_bin[k].data() + y * W;
+            const uint8_t (&col)[3] = kPalette[k % 12];
+            for (int x = 0; x < W; ++x) {
+                if (m[x]) {
+                    dst[x*3+0] = static_cast<uint8_t>((1.0f - kAlpha) * dst[x*3+0] + kAlpha * col[0]);
+                    dst[x*3+1] = static_cast<uint8_t>((1.0f - kAlpha) * dst[x*3+1] + kAlpha * col[1]);
+                    dst[x*3+2] = static_cast<uint8_t>((1.0f - kAlpha) * dst[x*3+2] + kAlpha * col[2]);
+                }
+            }
+        }
+    }
+    // Draw a legend as color-tagged text at top-left of the right half.
+    // Text is a 4-pixel-tall dumb bitmap font — we just draw solid color
+    // swatches; labels are printed to stdout so the user sees which color
+    // maps to which phrase. (Real font rendering isn't worth the deps.)
+    for (size_t k = 0; k < labels.size() && k < 12; ++k) {
+        const int y0 = 6 + static_cast<int>(k) * 12;
+        const int y1 = y0 + 8;
+        if (y1 >= H) break;
+        const uint8_t (&col)[3] = kPalette[k % 12];
+        for (int y = y0; y < y1; ++y) {
+            for (int x = 6; x < 22; ++x) {
+                uint8_t * px = panel.data() + (y * panelW + (W + x)) * 3;
+                px[0] = col[0]; px[1] = col[1]; px[2] = col[2];
+            }
+        }
+    }
+    stbi_write_png(path.c_str(), panelW, H, 3, panel.data(), panelW * 3);
+}
 
 // ── Detr-side constants that only depend on the grounding GGUF + image
 // spatial shape (not on the per-image LM output). Previously loaded from
@@ -244,24 +347,19 @@ std::vector<float> compute_query_pos_layer_0(
 
 int main(int argc, char ** argv) {
     std::string image_path = "/home/thorax/Downloads/warehouse_rgb.jpg";
-    std::string phrases_arg = "box,person,shelf,forklift";
-    std::string query;                // built from --phrases unless --query is passed
-    bool query_explicit = false;
+    std::string query = "Please segment the objects in the image.";
     std::string grounding_gguf = "/tmp/pathA_gguf/instructsam-grounding-f16.gguf";
     std::string lm_gguf = "/tmp/claude-1001/-home-thorax/e5355e82-8c80-4141-8828-424676e4ee8f/scratchpad/instructsam-as-qwen3vl/instructsam-lm-f16.gguf";
     std::string mmproj = "/tmp/claude-1001/-home-thorax/e5355e82-8c80-4141-8828-424676e4ee8f/scratchpad/instructsam-as-qwen3vl/instructsam-mmproj-f16.gguf";
     std::string ref_dir = "/tmp/pathA_reference/warehouse_rgb";
     std::string out_dir = "/tmp/pathA_reference/warehouse_rgb";
     bool use_cached_vision = true;
-    bool use_cached_lm = true;  // Native LM at 300+ tokens is O(N²·D) with no KV cache — hours per phrase.
-    bool generate_phrases = false;  // --generate: LM AR generation to discover phrases
     int32_t max_new_tokens = 128;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--image" && i+1 < argc) image_path = argv[++i];
-        else if (a == "--query" && i+1 < argc) { query = argv[++i]; query_explicit = true; }
-        else if (a == "--phrases" && i+1 < argc) phrases_arg = argv[++i];
+        else if (a == "--query" && i+1 < argc) query = argv[++i];
         else if (a == "--grounding" && i+1 < argc) grounding_gguf = argv[++i];
         else if (a == "--lm" && i+1 < argc) lm_gguf = argv[++i];
         else if (a == "--mmproj" && i+1 < argc) mmproj = argv[++i];
@@ -269,63 +367,44 @@ int main(int argc, char ** argv) {
         else if (a == "--out-dir" && i+1 < argc) out_dir = argv[++i];
         else if (a == "--use-cached-vision") use_cached_vision = true;
         else if (a == "--run-vision") use_cached_vision = false;
-        else if (a == "--use-cached-lm") use_cached_lm = true;
-        else if (a == "--run-lm") use_cached_lm = false;
-        else if (a == "--generate") { generate_phrases = true; use_cached_lm = false; }
         else if (a == "--max-new-tokens" && i+1 < argc) max_new_tokens = std::atoi(argv[++i]);
         else if (a == "--help" || a == "-h") {
-            std::cout << "sam3-instructsam-cli\n"
-                         "  --image PATH        (default: warehouse_rgb.jpg)\n"
-                         "  --query STRING\n"
-                         "  --phrases a,b,c     (segmentation targets)\n"
-                         "  --grounding PATH    (sam3cpp grounding GGUF)\n"
-                         "  --lm PATH           (Qwen3-VL LM GGUF)\n"
-                         "  --mmproj PATH       (mmproj GGUF)\n"
-                         "  --ref-dir PATH      (captured tensors for auxiliaries)\n"
-                         "  --out-dir PATH      (mask output dir)\n"
-                         "  --run-vision        (recompute vision on CPU ~25min; default use cached)\n";
+            std::cout <<
+                "sam3-instructsam-cli — natural-language image segmentation\n"
+                "\n"
+                "  --image PATH             input JPEG/PNG (default: warehouse_rgb.jpg)\n"
+                "  --query STRING           natural-language request (default: \"Please\n"
+                "                           segment the objects in the image.\"). When\n"
+                "                           the LM interprets the query as segmentation\n"
+                "                           it emits <|object_ref_start|>PHRASE<|object_ref_end|>\n"
+                "                           markers around each target; we extract those\n"
+                "                           phrases and produce a binary mask per phrase.\n"
+                "                           Non-segmentation queries just print the LM's\n"
+                "                           text response.\n"
+                "  --grounding PATH         sam3cpp grounding GGUF\n"
+                "  --lm PATH                Qwen3-VL LM GGUF (F16 or Q4_K_M)\n"
+                "  --mmproj PATH            mmproj GGUF (vision→LM embedding)\n"
+                "  --run-vision             recompute vision natively (~1 min on 12-core\n"
+                "                           CPU). Default is --use-cached-vision which\n"
+                "                           only works for the warehouse_rgb.jpg reference.\n"
+                "  --out-dir PATH           output directory (mkdir'd if missing)\n"
+                "  --max-new-tokens INT     LM AR decode budget (default 128)\n"
+                "\n"
+                "Outputs (in --out-dir):\n"
+                "  pred_masks.f32           raw [N, 10, 288, 288] mask logits\n"
+                "  mask_<i>_<phrase>.png    per-phrase binary mask, upsampled to input size\n"
+                "  overlay.png              input | tinted overlay panel with legend\n";
             return 0;
         }
     }
 
-    // Split phrases, trimming surrounding whitespace on each. Leading space
-    // matters for BPE — " box" and "box" tokenize to different IDs.
+    // Phrases are discovered by the LM (see stage 3 below), not passed in.
     std::vector<std::string> phrases;
-    {
-        std::stringstream ss(phrases_arg);
-        std::string p;
-        while (std::getline(ss, p, ',')) {
-            const auto b = p.find_first_not_of(" \t\r\n");
-            const auto e = p.find_last_not_of (" \t\r\n");
-            if (b == std::string::npos) continue;
-            phrases.push_back(p.substr(b, e - b + 1));
-        }
-    }
-
-    // Build the query from --phrases unless --query was explicitly passed.
-    // Matches InstructSAM's training-time phrasing so the LM interprets the
-    // request as a segmentation task and emits <|object_ref_start|>…
-    // <|object_ref_end|> markers around the phrase tokens (which downstream
-    // seg_output extraction depends on).
-    if (!query_explicit) {
-        std::string q = "Please segment ";
-        const size_t n = phrases.size();
-        for (size_t i = 0; i < n; ++i) {
-            if (i > 0) {
-                if (n == 2)                   q += " and ";        // "A and B"
-                else if (i + 1 == n)          q += ", and ";       // ", and Z"  (Oxford)
-                else                          q += ", ";
-            }
-            q += "the " + phrases[i];
-        }
-        q += " in the image.";
-        query = q;
-    }
+    std::vector<std::vector<int32_t>> phrase_tokens;  // LM-emitted subtokens per phrase
 
     std::cout << "=== sam3-instructsam-cli ===\n"
               << "  image     : " << image_path << "\n"
-              << "  query     : " << query << "\n"
-              << "  phrases   : "; for (auto & p : phrases) std::cout << p << " "; std::cout << "\n\n";
+              << "  query     : " << query << "\n\n";
 
     // ── Load all models ──────────────────────────────────────────────────
     std::cout << "=== stage 0: load models ===\n" << std::flush;
@@ -384,31 +463,11 @@ int main(int argc, char ** argv) {
         bb2 = std::move(fpn.bb2);
     }
 
-    // ── LM path: two modes ──────────────────────────────────────────────
+    // ── LM stage: tokenize + prefill + AR decode → extract phrases ─────────
     std::vector<std::vector<float>> seg_outs;
-    // Populated by the --generate branch; empty means "fall back to hardcoded
-    // phrase→tokens map" for the text_features section below.
-    std::vector<std::vector<int32_t>> generated_phrase_tokens_outer;
-    if (use_cached_lm) {
-        std::cout << "\n=== stage 3: LM (--use-cached-lm — loading PyTorch seg_output) ===\n"
-                     "  (--run-lm swaps in native LM forward; very slow without KV cache)\n";
-        // Sanity-run tokenizer + mmproj to prove the LM front-end works even in
-        // cached mode. Cheap: mmproj is ~10s, tokenizer <1s.
-        const auto full_tokens = tokz->tokenize_chat(query);
-        std::cout << "  ✓ tokenizer: " << full_tokens.size() << " tokens\n";
-        auto tmm = std::chrono::steady_clock::now();
-        const auto img_emb = mm->encode_image_file(image_path);
-        std::cout << "  ✓ mmproj: " << img_emb.n_tokens << " image tokens ("
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - tmm).count() << " ms)\n";
-        for (size_t pi = 0; pi < phrases.size(); ++pi) {
-            std::vector<int64_t> so_s;
-            const auto so = read_bin_f32(ref_dir + "/binaries_obj" + std::to_string(pi) +
-                                          "/lmb_seg_output_embeddings.f32", so_s);
-            seg_outs.push_back(std::move(so));
-        }
-    } else {
-        std::cout << "\n=== stage 3: LM (--run-lm — native forward, KV-cached prefix) ===\n" << std::flush;
+    std::string gen_text;               // full detokenized LM response, printed later
+    {
+        std::cout << "\n=== stage 3: LM (tokenize + prefill + AR decode) ===\n" << std::flush;
         const auto full_tokens = tokz->tokenize_chat(query);
         const auto & sp = tokz->specials();
         size_t image_pad_pos = 0;
@@ -438,14 +497,6 @@ int main(int argc, char ** argv) {
             std::memcpy(prefix_embeds.data() + (n_before + n_img + i) * H, e.data(), H * sizeof(float));
         }
 
-        std::vector<int64_t> mq_s, ms_s, me_s;
-        const auto mask_queries = read_bin_f32("/tmp/pathA_reference/instructsam_mask_queries.f32",   mq_s);
-        const auto mask_start   = read_bin_f32("/tmp/pathA_reference/instructsam_mask_start_embed.f32", ms_s);
-        const auto mask_end     = read_bin_f32("/tmp/pathA_reference/instructsam_mask_end_embed.f32",   me_s);
-
-        // Prefill the shared prefix (text + image + text) with a bonus:
-        // grab the last hidden state so we can start free-form generation
-        // if --generate is set.
         std::vector<int32_t> pref_pos(n_prefix);
         for (size_t i = 0; i < n_prefix; ++i) pref_pos[i] = static_cast<int32_t>(i);
         auto tpref = std::chrono::steady_clock::now();
@@ -453,92 +504,77 @@ int main(int argc, char ** argv) {
             prefix_embeds, static_cast<int64_t>(n_prefix), pref_pos);
         auto prefix_cache = std::move(pfr.cache);
         std::vector<float> next_hidden = std::move(pfr.last_hidden);
-        std::cout << "  ✓ prefill_with_last_hidden (" << n_prefix << " tokens) in "
+        std::cout << "  ✓ prefill (" << n_prefix << " tokens) in "
                   << std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::steady_clock::now() - tpref).count() << "s\n";
 
-        // Standalone-context BPE tokens (as they appear inside
-        // <|object_ref_start|>…<|object_ref_end|>). Uses our llama.cpp
-        // tokenizer wrapper with parse_special=false and add_special=false —
-        // matches how InstructSAM's LM emits phrase tokens between the
-        // ref_start/ref_end markers.
-        auto tokenize_phrase = [&](const std::string & p) -> std::vector<int32_t> {
-            return tokz->tokenize_raw(p);
-        };
-
-        // ── Free-form generation branch ─────────────────────────────────
-        // Overrides `phrases` with names extracted from the LM's own output.
-        // We generate a working cache copy so seg_output extraction below
-        // still starts from the pristine prefix cache.
-        std::vector<std::vector<int32_t>> generated_phrase_tokens;
-        if (generate_phrases) {
-            std::cout << "\n=== stage 3b: --generate — greedy AR decode ===\n" << std::flush;
-            auto gen_cache = prefix_cache;  // deep copy — decode_step will extend it
-            std::vector<int32_t> gen_tokens;
-            std::vector<float> cur_hidden = next_hidden;
-            auto tgen = std::chrono::steady_clock::now();
-            // Greedy AR decode. If the first sampled token is <|im_end|>,
-            // take second-best instead — that's almost never what you want
-            // at position 0 for InstructSAM (a real InstructSAM response to
-            // a segmentation query starts with <|object_ref_start|>, and
-            // im_end at token 0 is usually accumulated bf16→f32 drift over
-            // the 301-token prefix ranking it top-1 by a hair).
-            // Beyond token 0, sample as-is and stop on im_end normally.
-            // If the LM doesn't produce object_ref_start naturally it means
-            // the query wasn't interpreted as a segmentation request — pass
-            // an explicit --phrases list instead of --generate in that case.
-            for (int step = 0; step < max_new_tokens; ++step) {
-                const auto logits = lm_fwd.logits_for_hidden(cur_hidden);
-                int32_t best = 0; float bv = logits[0];
-                for (int32_t v = 1; v < static_cast<int32_t>(logits.size()); ++v)
-                    if (logits[v] > bv) { bv = logits[v]; best = v; }
-                if (step == 0 && best == sp.im_end) {
-                    int32_t alt = -1; float av = -std::numeric_limits<float>::infinity();
-                    for (int32_t v = 0; v < static_cast<int32_t>(logits.size()); ++v)
-                        if (v != sp.im_end && logits[v] > av) { av = logits[v]; alt = v; }
-                    if (alt >= 0) best = alt;
-                }
-                gen_tokens.push_back(best);
-                if (best == sp.im_end) break;
-                const auto emb = lm_fwd.embed_for_token(best);
-                cur_hidden = lm_fwd.decode_step(gen_cache, emb,
-                                                static_cast<int32_t>(n_prefix + step));
+        // Greedy AR decode from --query. Defensive skip on <|im_end|> at
+        // step 0 (bf16 drift over the prefix can rank it top-1 by a hair);
+        // beyond that, sample as-is and stop on im_end.
+        auto gen_cache = prefix_cache;
+        std::vector<int32_t> gen_tokens;
+        std::vector<float> cur_hidden = next_hidden;
+        auto tgen = std::chrono::steady_clock::now();
+        for (int step = 0; step < max_new_tokens; ++step) {
+            const auto logits = lm_fwd.logits_for_hidden(cur_hidden);
+            int32_t best = 0; float bv = logits[0];
+            for (int32_t v = 1; v < static_cast<int32_t>(logits.size()); ++v)
+                if (logits[v] > bv) { bv = logits[v]; best = v; }
+            if (step == 0 && best == sp.im_end) {
+                int32_t alt = -1; float av = -std::numeric_limits<float>::infinity();
+                for (int32_t v = 0; v < static_cast<int32_t>(logits.size()); ++v)
+                    if (v != sp.im_end && logits[v] > av) { av = logits[v]; alt = v; }
+                if (alt >= 0) best = alt;
             }
-            const auto gen_s = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - tgen).count();
-            std::cout << "  ✓ generated " << gen_tokens.size() << " tokens in " << gen_s << "s\n";
-            std::cout << "  raw: " << tokz->detokenize(gen_tokens) << "\n";
+            gen_tokens.push_back(best);
+            if (best == sp.im_end) break;
+            const auto emb = lm_fwd.embed_for_token(best);
+            cur_hidden = lm_fwd.decode_step(gen_cache, emb,
+                                            static_cast<int32_t>(n_prefix + step));
+        }
+        std::cout << "  ✓ AR decode " << gen_tokens.size() << " tokens in "
+                  << std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - tgen).count() << "s\n";
+        gen_text = tokz->detokenize(gen_tokens);
 
-            // Extract phrases between object_ref_start and object_ref_end
-            phrases.clear();
-            for (size_t i = 0; i < gen_tokens.size(); ++i) {
-                if (gen_tokens[i] == sp.object_ref_start) {
-                    size_t j = i + 1;
-                    while (j < gen_tokens.size() && gen_tokens[j] != sp.object_ref_end) ++j;
-                    if (j < gen_tokens.size()) {
-                        std::vector<int32_t> mid(gen_tokens.begin() + i + 1,
-                                                 gen_tokens.begin() + j);
-                        phrases.push_back(tokz->detokenize(mid));
-                        generated_phrase_tokens.push_back(mid);
-                    }
-                    i = j;
+        // Extract phrases between object_ref_start / object_ref_end.
+        for (size_t i = 0; i < gen_tokens.size(); ++i) {
+            if (gen_tokens[i] == sp.object_ref_start) {
+                size_t j = i + 1;
+                while (j < gen_tokens.size() && gen_tokens[j] != sp.object_ref_end) ++j;
+                if (j < gen_tokens.size()) {
+                    std::vector<int32_t> mid(gen_tokens.begin() + i + 1,
+                                             gen_tokens.begin() + j);
+                    phrases.push_back(tokz->detokenize(mid));
+                    phrase_tokens.push_back(mid);
                 }
+                i = j;
             }
-            std::cout << "  extracted " << phrases.size() << " phrase(s): ";
+        }
+        std::cout << "  extracted " << phrases.size() << " phrase(s)";
+        if (!phrases.empty()) {
+            std::cout << ": ";
             for (auto & p : phrases) std::cout << "\"" << p << "\" ";
-            std::cout << "\n";
-            if (phrases.empty()) {
-                std::cerr << "  ✗ no phrases found — try a different query or increase --max-new-tokens\n";
-                return 5;
-            }
-            generated_phrase_tokens_outer = generated_phrase_tokens;
+        }
+        std::cout << "\n";
+
+        // No phrases → LM didn't route to segmentation. Print the text and
+        // exit cleanly; no masks to produce.
+        if (phrases.empty()) {
+            std::cout << "\n=== LM response ===\n" << gen_text << "\n\n"
+                         "(no <|object_ref_start|> markers in output — the LM did not\n"
+                         "interpret this query as a segmentation task. No masks written.)\n";
+            return 0;
         }
 
+        // Compute seg_output_embeddings per phrase via the injection path.
+        std::vector<int64_t> mq_s, ms_s, me_s;
+        const auto mask_queries = read_bin_f32("/tmp/pathA_reference/instructsam_mask_queries.f32",   mq_s);
+        const auto mask_start   = read_bin_f32("/tmp/pathA_reference/instructsam_mask_start_embed.f32", ms_s);
+        const auto mask_end     = read_bin_f32("/tmp/pathA_reference/instructsam_mask_end_embed.f32",   me_s);
         for (size_t pi = 0; pi < phrases.size(); ++pi) {
-            const auto ptoks = generate_phrases ? generated_phrase_tokens[pi]
-                                                 : tokenize_phrase(phrases[pi]);
             std::vector<int32_t> appended = {sp.object_ref_start};
-            for (int32_t t : ptoks) appended.push_back(t);
+            for (int32_t t : phrase_tokens[pi]) appended.push_back(t);
             appended.push_back(sp.object_ref_end);
             std::vector<float> ap_embeds(appended.size() * H);
             for (size_t i = 0; i < appended.size(); ++i) {
@@ -550,10 +586,9 @@ int main(int argc, char ** argv) {
                 prefix_cache, ap_embeds, static_cast<int64_t>(appended.size()),
                 mask_queries, mask_start, mask_end);
             seg_outs.push_back(std::move(so));
-            std::cout << "  ✓ phrase \"" << phrases[pi] << "\" ("
+            std::cout << "  ✓ seg_output for \"" << phrases[pi] << "\" ("
                       << std::chrono::duration_cast<std::chrono::seconds>(
-                             std::chrono::steady_clock::now() - tphr).count()
-                      << "s decode w/ cached " << n_prefix << "-token prefix)\n";
+                             std::chrono::steady_clock::now() - tphr).count() << "s)\n";
         }
     }
 
@@ -563,9 +598,6 @@ int main(int argc, char ** argv) {
     // (vision_pos, init_refs, qpos_L0) are per-vision-shape/per-decoder
     // constants that don't depend on the LM output — they'll come from the
     // grounding GGUF once wired directly.
-    auto tokenize_phrase_for_text = [&](const std::string & p) -> std::vector<int32_t> {
-        return tokz->tokenize_raw(p);
-    };
     constexpr int64_t kPhraseH = 2048;
     constexpr int64_t kPhraseMax = 32;
     const auto pad_embed = lm_fwd.embed_for_token(0);  // padding = token id 0
@@ -592,11 +624,11 @@ int main(int argc, char ** argv) {
         (void)odir;  // no per-obj ref files needed anymore
 
         // Native: build padded phrase embed tensor, project via text_hidden_fcs.
+        // Phrase tokens came directly from the LM's own AR output, so BPE
+        // matches the standalone-context tokens InstructSAM emits between
+        // <|object_ref_start|> and <|object_ref_end|>.
         std::vector<int32_t> phrase_ids = {151646};  // <|object_ref_start|>
-        const auto & inner = (pi < generated_phrase_tokens_outer.size())
-            ? generated_phrase_tokens_outer[pi]
-            : tokenize_phrase_for_text(phrases[pi]);
-        for (int32_t t : inner) phrase_ids.push_back(t);
+        for (int32_t t : phrase_tokens[pi]) phrase_ids.push_back(t);
         phrase_ids.push_back(151647);  // <|object_ref_end|>
         const int64_t n_valid = static_cast<int64_t>(phrase_ids.size());
         std::vector<float> phrase_padded(kPhraseMax * kPhraseH, 0.0f);
@@ -655,40 +687,66 @@ int main(int argc, char ** argv) {
                   << (out.pred_masks.size() / (288*288)) << ", 288, 288]\n";
     }
 
-    // ── Write pred_masks as one big [N, 10, 288, 288] blob ──────────────
+    // ── Write raw f32 blob + per-object PNGs + overlay panel ────────────
     std::vector<float> all_masks;
     for (auto & m : per_obj_masks) all_masks.insert(all_masks.end(), m.begin(), m.end());
     const int64_t N = static_cast<int64_t>(phrases.size());
-    write_bin_f32(out_dir + "/e2e_pred_masks_cli.f32", all_masks, {N, 10, 288, 288});
-    std::cout << "\n  ✓ wrote " << out_dir << "/e2e_pred_masks_cli.f32  [" << N << ", 10, 288, 288]\n";
+    write_bin_f32(out_dir + "/pred_masks.f32", all_masks, {N, 10, 288, 288});
+    std::cout << "\n  ✓ wrote " << out_dir << "/pred_masks.f32  [" << N << ", 10, 288, 288]\n";
 
-    // Optional: compare vs PyTorch pred_masks per object (warehouse-image
-    // sanity check). Skip silently for arbitrary images / phrase counts —
-    // the ref files at ref_dir/binaries_obj{i}/md_pred_masks.f32 only exist
-    // for the 4-phrase warehouse capture.
-    int n_compared = 0;
-    double total_cs = 0.0;
-    for (size_t pi = 0; pi < phrases.size(); ++pi) {
-        const std::string ref_path = ref_dir + "/binaries_obj" + std::to_string(pi) +
-                                     "/md_pred_masks.f32";
-        std::ifstream probe(ref_path, std::ios::binary);
-        if (!probe.good()) continue;
-        probe.close();
-        if (n_compared == 0) std::cout << "\n=== parity vs PyTorch pred_masks ===\n";
-        std::vector<int64_t> rs;
-        const auto ref = read_bin_f32(ref_path, rs);
-        double dot = 0.0, na = 0.0, nb = 0.0;
-        for (size_t i = 0; i < ref.size(); ++i) {
-            dot += (double)per_obj_masks[pi][i] * ref[i];
-            na  += (double)per_obj_masks[pi][i] * per_obj_masks[pi][i];
-            nb  += (double)ref[i] * ref[i];
-        }
-        const double cs = dot / (std::sqrt(na) * std::sqrt(nb));
-        total_cs += cs;
-        ++n_compared;
-        std::cout << "  obj " << pi << " (" << phrases[pi] << "): cos_sim = " << cs << "\n";
+    // Load the input image for output-size masks + overlay panel.
+    int in_w = 0, in_h = 0, in_comp = 0;
+    unsigned char * in_rgb = stbi_load(image_path.c_str(), &in_w, &in_h, &in_comp, 3);
+    if (!in_rgb) {
+        std::cerr << "  ✗ stbi_load failed for " << image_path << " — skipping PNG output\n";
+        std::cout << "\n✓ CLI complete\n";
+        return 0;
     }
-    if (n_compared > 0) std::cout << "  mean cos_sim = " << (total_cs / n_compared) << "\n";
+
+    // Pick each phrase's best mask slot by peak sigmoid activation (proxy
+    // for cls_score — we don't currently emit cls_score from the DETR chain).
+    std::vector<std::vector<uint8_t>> per_obj_binary;
+    per_obj_binary.reserve(phrases.size());
+    for (size_t pi = 0; pi < phrases.size(); ++pi) {
+        const float * m10 = per_obj_masks[pi].data();
+        int best_slot = 0; float best_peak = -1.0f;
+        for (int s = 0; s < 10; ++s) {
+            const float * slot = m10 + s * 288 * 288;
+            float peak = 0.0f;
+            for (int i = 0; i < 288 * 288; ++i) {
+                const float sig = 1.0f / (1.0f + std::exp(-slot[i]));
+                if (sig > peak) peak = sig;
+            }
+            if (peak > best_peak) { best_peak = peak; best_slot = s; }
+        }
+        std::vector<float> slot_logits(m10 + best_slot * 288 * 288,
+                                       m10 + (best_slot + 1) * 288 * 288);
+        auto binary = mask_logits_to_binary(slot_logits, in_h, in_w);
+
+        // File-safe label — replace spaces/slashes so "pallet jack" → "pallet_jack"
+        std::string label_safe = phrases[pi];
+        for (char & c : label_safe) if (c == ' ' || c == '/' || c == '\\') c = '_';
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), "%s/mask_%02zu_%s.png",
+                      out_dir.c_str(), pi, label_safe.c_str());
+        stbi_write_png(buf, in_w, in_h, 1, binary.data(), in_w);
+        std::cout << "  ✓ wrote " << buf << "  (slot " << best_slot
+                  << ", peak conf " << best_peak << ")\n";
+        per_obj_binary.push_back(std::move(binary));
+    }
+
+    // Overlay panel: [orig | tinted composite].
+    const std::string overlay_path = out_dir + "/overlay.png";
+    write_overlay_panel(overlay_path, in_rgb, in_w, in_h, per_obj_binary, phrases);
+    std::cout << "  ✓ wrote " << overlay_path << "  ("
+              << (in_w * 2) << "×" << in_h << ")\n";
+    std::cout << "  legend (color → phrase):\n";
+    for (size_t k = 0; k < phrases.size() && k < 12; ++k) {
+        std::cout << "    ["
+                  << (int)kPalette[k % 12][0] << "," << (int)kPalette[k % 12][1]
+                  << "," << (int)kPalette[k % 12][2] << "] → " << phrases[k] << "\n";
+    }
+    stbi_image_free(in_rgb);
 
     std::cout << "\n✓ CLI complete\n";
     return 0;
