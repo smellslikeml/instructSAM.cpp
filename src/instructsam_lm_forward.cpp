@@ -56,6 +56,7 @@ std::vector<float> cpu_rms_norm(
     const std::vector<float> & weight, float eps = kRmsNormEps
 ) {
     std::vector<float> out(x.size());
+    #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < N; ++i) {
         double sumsq = 0.0;
         for (int64_t d = 0; d < D; ++d) {
