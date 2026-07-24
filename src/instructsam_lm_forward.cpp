@@ -72,21 +72,24 @@ std::vector<float> cpu_rms_norm(
 }
 
 // Linear: y = x @ w.T + b (b optional). x [N, D_in], w [D_out, D_in], y [N, D_out].
+// Parallelized over the N × D_out output positions via OpenMP. Inner k loop
+// gets AVX2/AVX512 auto-vectorized with -march=native.
 std::vector<float> cpu_linear(
     const std::vector<float> & x, int64_t N, int64_t D_in, int64_t D_out,
     const std::vector<float> & w,
     const std::vector<float> * b = nullptr
 ) {
     std::vector<float> y(static_cast<size_t>(N * D_out));
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t o = 0; o < D_out; ++o) {
-            float s = b ? (*b)[static_cast<size_t>(o)] : 0.0f;
-            for (int64_t k = 0; k < D_in; ++k) {
-                s += w[static_cast<size_t>(o * D_in + k)] *
-                     x[static_cast<size_t>(n * D_in + k)];
-            }
-            y[static_cast<size_t>(n * D_out + o)] = s;
-        }
+    const int64_t total_out = N * D_out;
+    #pragma omp parallel for schedule(static)
+    for (int64_t idx = 0; idx < total_out; ++idx) {
+        const int64_t n = idx / D_out;
+        const int64_t o = idx % D_out;
+        float s = b ? (*b)[static_cast<size_t>(o)] : 0.0f;
+        const float * xr = x.data() + n * D_in;
+        const float * wr = w.data() + o * D_in;
+        for (int64_t k = 0; k < D_in; ++k) s += wr[k] * xr[k];
+        y[static_cast<size_t>(idx)] = s;
     }
     return y;
 }
@@ -226,6 +229,7 @@ LayerForwardOut layer_forward(
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     std::vector<float> attn_out(static_cast<size_t>(N * kHiddenSize), 0.0f);
 
+    #pragma omp parallel for schedule(static)
     for (int64_t h = 0; h < kNumHeads; ++h) {
         const int64_t kv_h = h / kKvGroups;
         // For each new row i (absolute pos = n_cached + i), attend to positions [0, n_cached + i].
@@ -435,6 +439,7 @@ std::vector<float> InstructsamLmForward::run(
         const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
         std::vector<float> attn_out(static_cast<size_t>(seq_len * kHiddenSize));
 
+        #pragma omp parallel for schedule(static)
         for (int64_t h = 0; h < kNumHeads; ++h) {
             const int64_t kv_h = h / kKvGroups;  // GQA: 2 Q-heads share each KV-head
             // Compute S = Q_h @ K_kvh^T * scale, shape [seq, seq], with causal mask.

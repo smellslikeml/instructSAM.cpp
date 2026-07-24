@@ -113,6 +113,17 @@ target_link_libraries(sam3cpp
         ZLIB::ZLIB
 )
 
+# Perf: -march=native unlocks AVX2/AVX512 for compiler auto-vectorization
+# on our scalar cpu_linear / attention loops. OpenMP parallelizes them.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(sam3cpp PUBLIC OpenMP::OpenMP_CXX)
+endif()
+target_compile_options(sam3cpp PRIVATE
+    $<$<CONFIG:Release>:-march=native -O3>
+    $<$<CONFIG:RelWithDebInfo>:-march=native -O2>
+)
+
 target_compile_definitions(sam3cpp
     PRIVATE
         SAM3CPP_DEFAULT_BPE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/bpe_simple_vocab_16e6.txt.gz"
