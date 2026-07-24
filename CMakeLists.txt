@@ -254,6 +254,9 @@ target_link_libraries(sam3-instructsam-text-features-test PRIVATE sam3cpp)
 add_executable(sam3-instructsam-neck-bench tools/sam3_instructsam_neck_bench.cpp)
 target_link_libraries(sam3-instructsam-neck-bench PRIVATE sam3cpp)
 
+add_executable(sam3-flash-attn-test tools/sam3_flash_attn_test.cpp)
+target_link_libraries(sam3-flash-attn-test PRIVATE sam3cpp)
+
 add_executable(sam3-instructsam-vision-encoder-test tools/sam3_instructsam_vision_encoder_test.cpp)
 target_link_libraries(sam3-instructsam-vision-encoder-test PRIVATE sam3cpp)
 

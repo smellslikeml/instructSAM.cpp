@@ -1,5 +1,6 @@
 #include "sam3/instructsam_vision_encoder.h"
 
+#include "sam3/detail/cpu_attn.h"
 #include "sam3/detail/cpu_conv.h"
 #include "sam3/detail/cpu_linear.h"
 
@@ -700,47 +701,32 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
     apply_rope_2d_cpu(Q, num_windows, kNumHeads, seq_per_win, kHeadDim, rope);
     apply_rope_2d_cpu(K, num_windows, kNumHeads, seq_per_win, kHeadDim, rope);
 
-    // Scaled dot-product attention CPU-side (small compute — batched over windows/heads).
-    const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    // Scaled dot-product attention via ggml_flash_attn_ext.
+    // Input Q/K/V layout: (num_windows, kNumHeads, seq_per_win, kHeadDim)
+    // with kHeadDim innermost — matches the (batch, n_head, seq, head_dim)
+    // memory shape flash_attn expects.
+    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+    std::vector<float> attn_hns = detail::flash_attn(
+        Q, K, V,
+        /*batch=*/num_windows, /*n_head=*/kNumHeads, /*n_head_kv=*/kNumHeads,
+        /*seq_q=*/seq_per_win, /*seq_kv=*/seq_per_win, /*head_dim=*/kHeadDim,
+        attn_scale);
+
+    // flash_attn returns (batch, n_head, seq, head_dim). Repack into
+    // (batch, seq, n_head*head_dim) = attn[total_tokens, kHiddenSize] to
+    // match what the O-projection expects, mirroring the old code's tail.
     std::vector<float> attn(static_cast<size_t>(total_tokens * kHiddenSize));
-    // Parallelize across (window, head) — each is independent.
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for schedule(static)
     for (int64_t b = 0; b < num_windows; ++b) {
         for (int64_t h = 0; h < kNumHeads; ++h) {
-            const float * qh = Q.data() + ((b * kNumHeads + h) * seq_per_win) * kHeadDim;
-            const float * kh = K.data() + ((b * kNumHeads + h) * seq_per_win) * kHeadDim;
-            const float * vh = V.data() + ((b * kNumHeads + h) * seq_per_win) * kHeadDim;
-            std::vector<float> S(static_cast<size_t>(seq_per_win * seq_per_win));
-            for (int64_t i = 0; i < seq_per_win; ++i) {
-                for (int64_t j = 0; j < seq_per_win; ++j) {
-                    float s = 0.0f;
-                    for (int64_t d = 0; d < kHeadDim; ++d) {
-                        s += qh[i * kHeadDim + d] * kh[j * kHeadDim + d];
-                    }
-                    S[static_cast<size_t>(i * seq_per_win + j)] = s * scale;
-                }
-            }
-            for (int64_t i = 0; i < seq_per_win; ++i) {
-                float * row = S.data() + i * seq_per_win;
-                float m = row[0];
-                for (int64_t j = 1; j < seq_per_win; ++j) if (row[j] > m) m = row[j];
-                float sum = 0.0f;
-                for (int64_t j = 0; j < seq_per_win; ++j) { row[j] = std::exp(row[j] - m); sum += row[j]; }
-                for (int64_t j = 0; j < seq_per_win; ++j) row[j] /= sum;
-            }
-            for (int64_t i = 0; i < seq_per_win; ++i) {
-                for (int64_t d = 0; d < kHeadDim; ++d) {
-                    float y = 0.0f;
-                    for (int64_t j = 0; j < seq_per_win; ++j) {
-                        y += S[static_cast<size_t>(i * seq_per_win + j)] * vh[j * kHeadDim + d];
-                    }
-                    const size_t out_off = ((b * seq_per_win + i) * kNumHeads + h) * kHeadDim + d;
-                    attn[out_off] = y;
-                }
+            for (int64_t s = 0; s < seq_per_win; ++s) {
+                const size_t src = ((b * kNumHeads + h) * seq_per_win + s) * kHeadDim;
+                const size_t dst = ((b * seq_per_win + s) * kNumHeads + h) * kHeadDim;
+                std::memcpy(attn.data() + dst, attn_hns.data() + src,
+                            kHeadDim * sizeof(float));
             }
         }
     }
-
     auto attn_proj = cpu_linear(attn, total_tokens, kHiddenSize, kHiddenSize, ow, nullptr);
     for (int64_t n = 0; n < total_tokens; ++n)
         for (int64_t d = 0; d < kHiddenSize; ++d)
