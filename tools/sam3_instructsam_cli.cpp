@@ -245,7 +245,8 @@ std::vector<float> compute_query_pos_layer_0(
 int main(int argc, char ** argv) {
     std::string image_path = "/home/thorax/Downloads/warehouse_rgb.jpg";
     std::string phrases_arg = "box,person,shelf,forklift";
-    std::string query = "Please segment the box, the person, the shelf, and the forklift in the image.";
+    std::string query;                // built from --phrases unless --query is passed
+    bool query_explicit = false;
     std::string grounding_gguf = "/tmp/pathA_gguf/instructsam-grounding-f16.gguf";
     std::string lm_gguf = "/tmp/claude-1001/-home-thorax/e5355e82-8c80-4141-8828-424676e4ee8f/scratchpad/instructsam-as-qwen3vl/instructsam-lm-f16.gguf";
     std::string mmproj = "/tmp/claude-1001/-home-thorax/e5355e82-8c80-4141-8828-424676e4ee8f/scratchpad/instructsam-as-qwen3vl/instructsam-mmproj-f16.gguf";
@@ -259,7 +260,7 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--image" && i+1 < argc) image_path = argv[++i];
-        else if (a == "--query" && i+1 < argc) query = argv[++i];
+        else if (a == "--query" && i+1 < argc) { query = argv[++i]; query_explicit = true; }
         else if (a == "--phrases" && i+1 < argc) phrases_arg = argv[++i];
         else if (a == "--grounding" && i+1 < argc) grounding_gguf = argv[++i];
         else if (a == "--lm" && i+1 < argc) lm_gguf = argv[++i];
@@ -299,6 +300,26 @@ int main(int argc, char ** argv) {
             if (b == std::string::npos) continue;
             phrases.push_back(p.substr(b, e - b + 1));
         }
+    }
+
+    // Build the query from --phrases unless --query was explicitly passed.
+    // Matches InstructSAM's training-time phrasing so the LM interprets the
+    // request as a segmentation task and emits <|object_ref_start|>…
+    // <|object_ref_end|> markers around the phrase tokens (which downstream
+    // seg_output extraction depends on).
+    if (!query_explicit) {
+        std::string q = "Please segment ";
+        const size_t n = phrases.size();
+        for (size_t i = 0; i < n; ++i) {
+            if (i > 0) {
+                if (n == 2)                   q += " and ";        // "A and B"
+                else if (i + 1 == n)          q += ", and ";       // ", and Z"  (Oxford)
+                else                          q += ", ";
+            }
+            q += "the " + phrases[i];
+        }
+        q += " in the image.";
+        query = q;
     }
 
     std::cout << "=== sam3-instructsam-cli ===\n"
