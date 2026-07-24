@@ -275,12 +275,18 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Split phrases
+    // Split phrases, trimming surrounding whitespace on each. Leading space
+    // matters for BPE — " box" and "box" tokenize to different IDs.
     std::vector<std::string> phrases;
     {
         std::stringstream ss(phrases_arg);
         std::string p;
-        while (std::getline(ss, p, ',')) if (!p.empty()) phrases.push_back(p);
+        while (std::getline(ss, p, ',')) {
+            const auto b = p.find_first_not_of(" \t\r\n");
+            const auto e = p.find_last_not_of (" \t\r\n");
+            if (b == std::string::npos) continue;
+            phrases.push_back(p.substr(b, e - b + 1));
+        }
     }
 
     std::cout << "=== sam3-instructsam-cli ===\n"
@@ -607,13 +613,21 @@ int main(int argc, char ** argv) {
     write_bin_f32(out_dir + "/e2e_pred_masks_cli.f32", all_masks, {N, 10, 288, 288});
     std::cout << "\n  ✓ wrote " << out_dir << "/e2e_pred_masks_cli.f32  [" << N << ", 10, 288, 288]\n";
 
-    // Optional: compare vs PyTorch pred_masks per object
-    std::cout << "\n=== parity vs PyTorch pred_masks ===\n";
+    // Optional: compare vs PyTorch pred_masks per object (warehouse-image
+    // sanity check). Skip silently for arbitrary images / phrase counts —
+    // the ref files at ref_dir/binaries_obj{i}/md_pred_masks.f32 only exist
+    // for the 4-phrase warehouse capture.
+    int n_compared = 0;
     double total_cs = 0.0;
     for (size_t pi = 0; pi < phrases.size(); ++pi) {
+        const std::string ref_path = ref_dir + "/binaries_obj" + std::to_string(pi) +
+                                     "/md_pred_masks.f32";
+        std::ifstream probe(ref_path, std::ios::binary);
+        if (!probe.good()) continue;
+        probe.close();
+        if (n_compared == 0) std::cout << "\n=== parity vs PyTorch pred_masks ===\n";
         std::vector<int64_t> rs;
-        const auto ref = read_bin_f32(ref_dir + "/binaries_obj" + std::to_string(pi) +
-                                       "/md_pred_masks.f32", rs);
+        const auto ref = read_bin_f32(ref_path, rs);
         double dot = 0.0, na = 0.0, nb = 0.0;
         for (size_t i = 0; i < ref.size(); ++i) {
             dot += (double)per_obj_masks[pi][i] * ref[i];
@@ -622,9 +636,10 @@ int main(int argc, char ** argv) {
         }
         const double cs = dot / (std::sqrt(na) * std::sqrt(nb));
         total_cs += cs;
+        ++n_compared;
         std::cout << "  obj " << pi << " (" << phrases[pi] << "): cos_sim = " << cs << "\n";
     }
-    std::cout << "  mean cos_sim = " << (total_cs / phrases.size()) << "\n";
+    if (n_compared > 0) std::cout << "  mean cos_sim = " << (total_cs / n_compared) << "\n";
 
     std::cout << "\n✓ CLI complete\n";
     return 0;
