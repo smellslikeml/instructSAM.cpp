@@ -664,33 +664,36 @@ std::vector<float> InstructsamLmForward::logits_for_hidden(
         throw std::runtime_error("logits_for_hidden: input must be [2048]");
     }
     // Qwen3-VL ties input embedding for LM head. token_embd.weight is
-    // stored [hidden=2048, vocab=151936] col-major-in-ggml — meaning per-token
-    // row of size 2048 starts at offset token_id * 2048 * dtype. So
-    // logits[t] = sum_d hidden[d] * embed[t, d].
+    // stored [hidden=2048, vocab=151936] in ggml's ne convention — meaning
+    // per-token row of size 2048 is contiguous. Fetch the whole table once
+    // (622 MB F16 = 304 MB F32-decoded) then GEMV over it in parallel.
+    // Cache across calls in a mutable member so successive generation
+    // steps skip the fetch.
     ggml_tensor * emb = require_tensor(model_, "token_embd.weight");
+    if (embd_cache_f32_.empty()) {
+        embd_cache_f32_.resize(static_cast<size_t>(kVocabSize) * kHiddenSize);
+        if (emb->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(emb, embd_cache_f32_.data(), 0,
+                                    embd_cache_f32_.size() * sizeof(float));
+        } else if (emb->type == GGML_TYPE_F16) {
+            std::vector<ggml_fp16_t> buf(embd_cache_f32_.size());
+            ggml_backend_tensor_get(emb, buf.data(), 0, buf.size() * sizeof(ggml_fp16_t));
+            #pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < static_cast<int64_t>(buf.size()); ++i) {
+                embd_cache_f32_[i] = ggml_fp16_to_fp32(buf[i]);
+            }
+        } else {
+            throw std::runtime_error("logits_for_hidden: unsupported dtype for token_embd");
+        }
+    }
+
     std::vector<float> logits(static_cast<size_t>(kVocabSize), 0.0f);
-    if (emb->type == GGML_TYPE_F32) {
-        std::vector<float> row(kHiddenSize);
-        for (int32_t t = 0; t < kVocabSize; ++t) {
-            ggml_backend_tensor_get(emb, row.data(),
-                static_cast<size_t>(t) * kHiddenSize * sizeof(float),
-                kHiddenSize * sizeof(float));
-            float s = 0.0f;
-            for (int d = 0; d < kHiddenSize; ++d) s += hidden_2048[d] * row[d];
-            logits[static_cast<size_t>(t)] = s;
-        }
-    } else if (emb->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> row(kHiddenSize);
-        for (int32_t t = 0; t < kVocabSize; ++t) {
-            ggml_backend_tensor_get(emb, row.data(),
-                static_cast<size_t>(t) * kHiddenSize * sizeof(ggml_fp16_t),
-                kHiddenSize * sizeof(ggml_fp16_t));
-            float s = 0.0f;
-            for (int d = 0; d < kHiddenSize; ++d) s += hidden_2048[d] * ggml_fp16_to_fp32(row[d]);
-            logits[static_cast<size_t>(t)] = s;
-        }
-    } else {
-        throw std::runtime_error("logits_for_hidden: unsupported dtype for token_embd");
+    #pragma omp parallel for schedule(static)
+    for (int32_t t = 0; t < kVocabSize; ++t) {
+        const float * row = embd_cache_f32_.data() + static_cast<size_t>(t) * kHiddenSize;
+        float s = 0.0f;
+        for (int d = 0; d < kHiddenSize; ++d) s += hidden_2048[d] * row[d];
+        logits[static_cast<size_t>(t)] = s;
     }
     return logits;
 }

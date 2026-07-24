@@ -206,6 +206,9 @@ public:
 
 private:
     const GgufModel & model_;
+    // Lazy: full [vocab, hidden] = 304 MB f32 fetched once for
+    // logits_for_hidden. Reused across all generation steps.
+    mutable std::vector<float> embd_cache_f32_;
 };
 
 }  // namespace sam3
