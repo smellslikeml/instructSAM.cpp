@@ -460,6 +460,7 @@ int main(int argc, char ** argv) {
     std::string mmproj = "/tmp/claude-1001/-home-thorax/e5355e82-8c80-4141-8828-424676e4ee8f/scratchpad/instructsam-as-qwen3vl/instructsam-mmproj-f16.gguf";
     std::string ref_dir = "/tmp/pathA_reference/warehouse_rgb";
     std::string out_dir = "/tmp/pathA_reference/warehouse_rgb";
+    std::string mask_queries_path = "/tmp/pathA_reference/instructsam_mask_queries.f32";
     bool use_cached_vision = true;
     int32_t max_new_tokens = 128;
 
@@ -472,6 +473,7 @@ int main(int argc, char ** argv) {
         else if (a == "--mmproj" && i+1 < argc) mmproj = argv[++i];
         else if (a == "--ref-dir" && i+1 < argc) ref_dir = argv[++i];
         else if (a == "--out-dir" && i+1 < argc) out_dir = argv[++i];
+        else if (a == "--mask-queries" && i+1 < argc) mask_queries_path = argv[++i];
         else if (a == "--use-cached-vision") use_cached_vision = true;
         else if (a == "--run-vision") use_cached_vision = false;
         else if (a == "--max-new-tokens" && i+1 < argc) max_new_tokens = std::atoi(argv[++i]);
@@ -491,6 +493,10 @@ int main(int argc, char ** argv) {
                 "  --grounding PATH         sam3cpp grounding GGUF\n"
                 "  --lm PATH                Qwen3-VL LM GGUF (F16 or Q4_K_M)\n"
                 "  --mmproj PATH            mmproj GGUF (vision→LM embedding)\n"
+                "  --mask-queries PATH      instructsam_mask_queries.f32 sidecar\n"
+                "                           ([10, 2048] BIN1 blob — extracted from the\n"
+                "                           InstructSAM checkpoint via\n"
+                "                           tools/extract_mask_queries.py)\n"
                 "  --run-vision             recompute vision natively (~1 min on 12-core\n"
                 "                           CPU). Default is --use-cached-vision which\n"
                 "                           only works for the warehouse_rgb.jpg reference.\n"
@@ -730,7 +736,7 @@ int main(int argc, char ** argv) {
         // hidden states via llama_get_embeddings_ith — these are the
         // seg_output_embeddings that feed mask_hidden_fcs → DETR.
         std::vector<int64_t> mq_s;
-        const auto mask_queries = read_bin_f32("/tmp/pathA_reference/instructsam_mask_queries.f32", mq_s);
+        const auto mask_queries = read_bin_f32(mask_queries_path, mq_s);
         if (mask_queries.size() != static_cast<size_t>(10 * H)) {
             throw std::runtime_error("mask_queries size mismatch: got " +
                 std::to_string(mask_queries.size()) + " expected " + std::to_string(10 * H));
