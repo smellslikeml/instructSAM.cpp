@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # sam3-instructsam — natural-language image segmentation, CPU-only.
 #
-# Builds a self-contained image whose entrypoint is `sam3-instructsam-cli`.
+# Builds a self-contained image whose entrypoint is `instructsam`.
 # Weights are converted from CircleRadon/InstructSAM-2B AT BUILD TIME
 # (~4 GB safetensors download + ~5 min conversion on a fast box), so the
 # published image is a self-contained runtime — no HF pull at run-time.
@@ -119,7 +119,7 @@ RUN mkdir -p /models \
         /models/instructsam-lm-f16.gguf \
         /models/instructsam-lm-Q4_K_M.gguf Q4_K_M
 # --token-embedding-type f16: llama-quantize's default for Q4_K_M is to
-# downcast token_embd.weight to Q6_K, but sam3-instructsam-cli's
+# downcast token_embd.weight to Q6_K, but instructsam's
 # InstructsamLmForward::embed_for_token (used to fetch the mask_start /
 # mask_end / phrase-token embeddings that seed the seg-output injection)
 # only supports F32 and F16. Force F16 here so both paths agree.
@@ -145,7 +145,7 @@ RUN /opt/convert-venv/bin/pip install --no-cache-dir gguf safetensors torch --ex
 RUN cd /src/sam3cpp \
     && cmake -S . -B build \
         -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --target sam3-instructsam-cli --parallel "$(nproc)"
+    && cmake --build build --target instructsam --parallel "$(nproc)"
 
 # Reclaim disk: drop safetensors + intermediate build trees. The runtime
 # stage only needs the built binary, the shared libs, and /models.
@@ -161,7 +161,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary + models.
-COPY --from=builder /src/sam3cpp/build/sam3-instructsam-cli /usr/local/bin/sam3-instructsam-cli
+COPY --from=builder /src/sam3cpp/build/instructsam /usr/local/bin/instructsam
 COPY --from=builder /models /models
 
 # Default model paths — override with --lm / --mmproj / --grounding /

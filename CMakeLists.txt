@@ -384,14 +384,14 @@ if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
         OpenMP::OpenMP_CXX
         m dl)
 
-    # Day 9d — end-to-end CLI
-    add_executable(sam3-instructsam-cli tools/sam3_instructsam_cli.cpp)
-    target_include_directories(sam3-instructsam-cli PRIVATE
+    # End-to-end CLI
+    add_executable(instructsam tools/instructsam.cpp)
+    target_include_directories(instructsam PRIVATE
         "${LLAMA_CPP_ROOT}/include"
         "${LLAMA_CPP_ROOT}/tools/mtmd"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"                    # stb_image.h
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/examples")         # stb_image_write.h
-    target_link_libraries(sam3-instructsam-cli PRIVATE
+    target_link_libraries(instructsam PRIVATE
         sam3cpp
         sam3cpp_llama_tokenizer
         sam3cpp_mmproj
@@ -409,7 +409,7 @@ if(EXISTS "${LLAMA_CPP_ROOT}/build/src/libllama.a")
     # STB_IMAGE_IMPLEMENTATION. As long as we only reference stbi_load /
     # stbi_image_free (not the 16-bit variants that specifically collide),
     # letting the linker keep the first-seen definition is safe.
-    target_link_options(sam3-instructsam-cli PRIVATE
+    target_link_options(instructsam PRIVATE
         "LINKER:--allow-multiple-definition")
 else()
     message(STATUS "llama.cpp build not found at ${LLAMA_CPP_ROOT}/build — skipping Piece 3 targets")

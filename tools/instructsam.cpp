@@ -1,4 +1,4 @@
-// sam3-instructsam-cli — Day 9d
+// instructsam — Day 9d
 //
 // End-to-end runnable CLI: image + text query → mask PNGs.
 //
@@ -479,7 +479,7 @@ int main(int argc, char ** argv) {
         else if (a == "--max-new-tokens" && i+1 < argc) max_new_tokens = std::atoi(argv[++i]);
         else if (a == "--help" || a == "-h") {
             std::cout <<
-                "sam3-instructsam-cli — natural-language image segmentation\n"
+                "instructsam — natural-language image segmentation\n"
                 "\n"
                 "  --image PATH             input JPEG/PNG (default: warehouse_rgb.jpg)\n"
                 "  --query STRING           natural-language request (default: \"Please\n"
@@ -515,7 +515,7 @@ int main(int argc, char ** argv) {
     std::vector<std::string> phrases;
     std::vector<std::vector<int32_t>> phrase_tokens;  // LM-emitted subtokens per phrase
 
-    std::cout << "=== sam3-instructsam-cli ===\n"
+    std::cout << "=== instructsam ===\n"
               << "  image     : " << image_path << "\n"
               << "  query     : " << query << "\n\n";
 
