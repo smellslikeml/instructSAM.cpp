@@ -237,6 +237,9 @@ target_link_libraries(sam3-instructsam-full-native-e2e PRIVATE sam3cpp)
 add_executable(sam3-instructsam-lm-kv-cache-test tools/sam3_instructsam_lm_kv_cache_test.cpp)
 target_link_libraries(sam3-instructsam-lm-kv-cache-test PRIVATE sam3cpp)
 
+add_executable(sam3-instructsam-text-features-test tools/sam3_instructsam_text_features_test.cpp)
+target_link_libraries(sam3-instructsam-text-features-test PRIVATE sam3cpp)
+
 add_executable(sam3-instructsam-vision-encoder-test tools/sam3_instructsam_vision_encoder_test.cpp)
 target_link_libraries(sam3-instructsam-vision-encoder-test PRIVATE sam3cpp)
 

@@ -179,6 +179,7 @@ int main(int argc, char ** argv) {
     if (!lm.load(lm_gguf, false, {}, true)) { std::cerr << "lm load failed\n"; return 3; }
     sam3::InstructsamLmForward       lm_fwd(lm);
     sam3::InstructsamMaskHiddenFcs   mask_bridge(grounding);
+    sam3::InstructsamTextHiddenFcs   text_bridge(grounding);
     sam3::InstructsamDetrEncoder     enc(grounding);
     sam3::InstructsamDecoder         dec(grounding);
     sam3::InstructsamPromptCrossAttn pca(grounding);
@@ -282,11 +283,14 @@ int main(int argc, char ** argv) {
                   << std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::steady_clock::now() - tpref).count() << "s\n";
 
+        // Standalone-context BPE tokens (as they appear inside
+        // <|object_ref_start|>…<|object_ref_end|>), verified against captured
+        // text_output.txt from InstructSAM PyTorch inference.
         auto tokenize_phrase = [&](const std::string & p) -> std::vector<int32_t> {
-            if (p == "box")      return {3745};
-            if (p == "person")   return {1697};
-            if (p == "shelf")    return {27645};
-            if (p == "forklift") return {369, 10561};
+            if (p == "box")      return {2011};
+            if (p == "person")   return {8987};
+            if (p == "shelf")    return {53950};
+            if (p == "forklift") return {44738, 34969};  // "fork" + "lift"
             throw std::runtime_error("phrase not in built-in map: " + p);
         };
         for (size_t pi = 0; pi < phrases.size(); ++pi) {
@@ -311,18 +315,54 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // ── DETR chain per object (auxiliaries from ref captures for now) ───
+    // ── DETR chain per object ──────────────────────────────────────────
+    // text_features / prompt_features / text_mask are computed natively via
+    // text_hidden_fcs from phrase tokens (see below). The remaining ref-loads
+    // (vision_pos, init_refs, qpos_L0) are per-vision-shape/per-decoder
+    // constants that don't depend on the LM output — they'll come from the
+    // grounding GGUF once wired directly.
+    auto tokenize_phrase_for_text = [](const std::string & p) -> std::vector<int32_t> {
+        if (p == "box")      return {2011};
+        if (p == "person")   return {8987};
+        if (p == "shelf")    return {53950};
+        if (p == "forklift") return {44738, 34969};
+        throw std::runtime_error("phrase not in built-in map: " + p);
+    };
+    constexpr int64_t kPhraseH = 2048;
+    constexpr int64_t kPhraseMax = 32;
+    const auto pad_embed = lm_fwd.embed_for_token(0);  // padding = token id 0
+
     std::cout << "\n=== stage 4: DETR chain per object ===\n";
     std::vector<std::vector<float>> per_obj_masks;
     for (size_t pi = 0; pi < phrases.size(); ++pi) {
         const std::string odir = ref_dir + "/binaries_obj" + std::to_string(pi);
-        std::vector<int64_t> vps, tfs, tms, pfs, rps, qps;
-        const auto vision_pos    = read_bin_f32(odir + "/enc_vision_pos_flat.f32",    vps);
-        const auto text_features = read_bin_f32(odir + "/enc_text_features.f32",      tfs);
-        const auto text_mask     = read_bin_f32(odir + "/md_pca_prompt_mask.f32",     tms);
-        const auto prompt_feats  = read_bin_f32(odir + "/md_pca_prompt_features.f32", pfs);
-        const auto init_refs     = read_bin_f32(odir + "/initial_reference_points.f32", rps);
-        const auto qpos_L0       = read_bin_f32(odir + "/query_pos_layer_0.f32",      qps);
+        std::vector<int64_t> vps, rps, qps;
+        const auto vision_pos = read_bin_f32(odir + "/enc_vision_pos_flat.f32",    vps);
+        const auto init_refs  = read_bin_f32(odir + "/initial_reference_points.f32", rps);
+        const auto qpos_L0    = read_bin_f32(odir + "/query_pos_layer_0.f32",      qps);
+
+        // Native: build padded phrase embed tensor, project via text_hidden_fcs.
+        std::vector<int32_t> phrase_ids = {151646};  // <|object_ref_start|>
+        for (int32_t t : tokenize_phrase_for_text(phrases[pi])) phrase_ids.push_back(t);
+        phrase_ids.push_back(151647);  // <|object_ref_end|>
+        const int64_t n_valid = static_cast<int64_t>(phrase_ids.size());
+        std::vector<float> phrase_padded(kPhraseMax * kPhraseH, 0.0f);
+        for (int64_t i = 0; i < n_valid; ++i) {
+            const auto e = lm_fwd.embed_for_token(phrase_ids[static_cast<size_t>(i)]);
+            std::memcpy(phrase_padded.data() + i * kPhraseH, e.data(), kPhraseH * sizeof(float));
+        }
+        for (int64_t i = n_valid; i < kPhraseMax; ++i) {
+            std::memcpy(phrase_padded.data() + i * kPhraseH, pad_embed.data(),
+                        kPhraseH * sizeof(float));
+        }
+        const auto txt_out = text_bridge.run(phrase_padded, {kPhraseMax, kPhraseH});
+        const auto & text_features = txt_out.data;          // [32, 256]
+        const auto & prompt_feats  = txt_out.data;          // identical (see obj-diff check)
+        std::vector<float> text_mask(kPhraseMax, 0.0f);
+        for (int64_t i = 0; i < n_valid; ++i) text_mask[static_cast<size_t>(i)] = 1.0f;
+        std::vector<int64_t> tfs = {kPhraseMax, 256};
+        std::vector<int64_t> pfs = {kPhraseMax, 256};
+        std::vector<int64_t> tms = {kPhraseMax};
 
         // 1) mask_hidden_fcs bridge on our LM-computed seg_output
         std::vector<int64_t> seg_shape = {10, 2048};
