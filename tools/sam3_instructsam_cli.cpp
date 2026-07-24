@@ -36,6 +36,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
+
 // stb_image_write for output PNGs — implementation lives in this TU.
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -421,7 +425,9 @@ int main(int argc, char ** argv) {
     sam3::InstructsamPixelDecoder    fpn(grounding);
     sam3::InstructsamMaskTail        tail(grounding);
     auto tokz = sam3::InstructsamTokenizer::load(lm_gguf);
-    auto mm   = sam3::InstructsamMmproj::load(mmproj, lm_gguf);
+    // (InstructsamMmproj — our thin wrapper around libmtmd — is no longer
+    // needed: stage 3 goes through mtmd_helper_eval_chunks directly to get
+    // correct M-RoPE positions for image tokens.)
     const auto oln_w = get_f32(grounding, "transformer.decoder.output_layer_norm.weight", 256);
     const auto oln_b = get_f32(grounding, "transformer.decoder.output_layer_norm.bias",   256);
     std::cout << "  ✓ all models loaded ("
@@ -463,81 +469,119 @@ int main(int argc, char ** argv) {
         bb2 = std::move(fpn.bb2);
     }
 
-    // ── LM stage: tokenize + prefill + AR decode → extract phrases ─────────
+    // ── LM stage: prefill via mtmd (correct M-RoPE) + AR decode via llama ──
+    //
+    // We used to hand-roll prefill with 1-D sequential positions through our
+    // native InstructsamLmForward. That was wrong for Qwen3-VL, which uses
+    // M-RoPE — image tokens need 3-D (t,h,w) coordinates matching the mmproj
+    // spatial grid. `mtmd_helper_get_n_pos` docs it plainly: "normally,
+    // n_pos is equal to n_tokens, but for M-RoPE it is different". Symptom
+    // was the LM routing to describe/OCR mode instead of emitting
+    // <|object_ref_start|> markers, despite correctly identifying objects.
+    //
+    // libmtmd + llama's mtmd_helper_eval_chunks bakes in the correct M-RoPE
+    // layout. We keep lm_fwd for its embed_for_token utility only.
     std::vector<std::vector<float>> seg_outs;
-    std::string gen_text;               // full detokenized LM response, printed later
+    std::string gen_text;
     {
-        std::cout << "\n=== stage 3: LM (tokenize + prefill + AR decode) ===\n" << std::flush;
-        const auto full_tokens = tokz->tokenize_chat(query);
+        std::cout << "\n=== stage 3: LM (mtmd prefill + llama AR decode) ===\n" << std::flush;
         const auto & sp = tokz->specials();
-        size_t image_pad_pos = 0;
-        for (size_t i = 0; i < full_tokens.size(); ++i) {
-            if (full_tokens[i] == sp.image_pad) { image_pad_pos = i; break; }
-        }
-        auto tmm = std::chrono::steady_clock::now();
-        const auto img_emb = mm->encode_image_file(image_path);
-        std::cout << "  ✓ mmproj: " << img_emb.n_tokens << " image tokens ("
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now() - tmm).count() << " ms)\n";
 
-        const int H = 2048;
-        const size_t n_before = image_pad_pos;
-        const size_t n_after  = full_tokens.size() - image_pad_pos - 1;
-        const size_t n_img    = static_cast<size_t>(img_emb.n_tokens);
-        const size_t n_prefix = n_before + n_img + n_after;
-        std::vector<float> prefix_embeds(n_prefix * H);
-        for (size_t i = 0; i < n_before; ++i) {
-            const auto e = lm_fwd.embed_for_token(full_tokens[i]);
-            std::memcpy(prefix_embeds.data() + i * H, e.data(), H * sizeof(float));
-        }
-        std::memcpy(prefix_embeds.data() + n_before * H, img_emb.data.data(),
-                    n_img * H * sizeof(float));
-        for (size_t i = 0; i < n_after; ++i) {
-            const auto e = lm_fwd.embed_for_token(full_tokens[image_pad_pos + 1 + i]);
-            std::memcpy(prefix_embeds.data() + (n_before + n_img + i) * H, e.data(), H * sizeof(float));
-        }
+        // --- Load LM model + create context with embeddings=true so we can
+        //     read per-token hidden states for the seg-output injection.
+        llama_model_params mp = llama_model_default_params();
+        mp.n_gpu_layers = 0;
+        llama_model * lm_model = llama_model_load_from_file(lm_gguf.c_str(), mp);
+        if (!lm_model) throw std::runtime_error("llama_model_load_from_file failed: " + lm_gguf);
 
-        std::vector<int32_t> pref_pos(n_prefix);
-        for (size_t i = 0; i < n_prefix; ++i) pref_pos[i] = static_cast<int32_t>(i);
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx           = 4096;
+        cp.n_batch         = 1024;
+        cp.n_ubatch        = 1024;
+        cp.n_seq_max       = 2;                          // seq 0 for AR, seq 1 for per-phrase seg injection
+        cp.embeddings      = true;                       // enable hidden-state readout
+        cp.pooling_type    = LLAMA_POOLING_TYPE_NONE;    // per-token, not pooled
+        cp.no_perf         = true;
+        cp.n_threads       = 12;
+        cp.n_threads_batch = 12;
+        llama_context * lctx = llama_init_from_model(lm_model, cp);
+        if (!lctx) throw std::runtime_error("llama_init_from_model failed");
+
+        const int32_t H = llama_model_n_embd(lm_model);
+        const int32_t V = llama_vocab_n_tokens(llama_model_get_vocab(lm_model));
+
+        // --- Load mtmd (vision projector) tied to lm_model.
+        mtmd_context_params mprm = mtmd_context_params_default();
+        mprm.use_gpu     = false;
+        mprm.print_timings = false;
+        mprm.n_threads   = 12;
+        mprm.warmup      = false;
+        mtmd_context * mctx = mtmd_init_from_file(mmproj.c_str(), lm_model, mprm);
+        if (!mctx) throw std::runtime_error("mtmd_init_from_file failed: " + mmproj);
+
+        // --- Build the prompt with the media marker mtmd wants (default
+        //     "<__media__>"). Match the InstructSAM chat template — no
+        //     system message.
+        const std::string prompt =
+            "<|im_start|>user\n" + std::string(mtmd_default_marker()) + query +
+            "<|im_end|>\n<|im_start|>assistant\n";
+        mtmd_input_text txt;
+        txt.text          = prompt.c_str();
+        txt.text_len      = static_cast<size_t>(prompt.size());
+        txt.add_special   = false;
+        txt.parse_special = true;
+
+        // --- Load bitmap, tokenize, prefill.
+        auto bmw = mtmd_helper_bitmap_init_from_file(mctx, image_path.c_str(), false);
+        if (!bmw.bitmap) throw std::runtime_error("bitmap init failed: " + image_path);
+        const mtmd_bitmap * bitmap_arr[] = { bmw.bitmap };
+
+        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+        int32_t rc = mtmd_tokenize(mctx, chunks, &txt, bitmap_arr, 1);
+        if (rc != 0) throw std::runtime_error("mtmd_tokenize rc=" + std::to_string(rc));
+
         auto tpref = std::chrono::steady_clock::now();
-        auto pfr = lm_fwd.prefill_with_last_hidden(
-            prefix_embeds, static_cast<int64_t>(n_prefix), pref_pos);
-        auto prefix_cache = std::move(pfr.cache);
-        std::vector<float> next_hidden = std::move(pfr.last_hidden);
-        std::cout << "  ✓ prefill (" << n_prefix << " tokens) in "
+        llama_pos n_past = 0;
+        rc = mtmd_helper_eval_chunks(mctx, lctx, chunks, /*n_past=*/0, /*seq_id=*/0,
+                                     cp.n_batch, /*logits_last=*/true, &n_past);
+        if (rc != 0) throw std::runtime_error("mtmd_helper_eval_chunks rc=" + std::to_string(rc));
+        const llama_pos n_past_prefill = n_past;
+        std::cout << "  ✓ mtmd prefill (n_past=" << n_past_prefill << ") in "
                   << std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::steady_clock::now() - tpref).count() << "s\n";
 
-        // Greedy AR decode from --query. Defensive skip on <|im_end|> at
-        // step 0 (bf16 drift over the prefix can rank it top-1 by a hair);
-        // beyond that, sample as-is and stop on im_end.
-        auto gen_cache = prefix_cache;
+        // --- AR greedy decode via llama_decode.
         std::vector<int32_t> gen_tokens;
-        std::vector<float> cur_hidden = next_hidden;
+        llama_batch bat = llama_batch_init(/*n_tokens=*/1, /*embd=*/0, /*n_seq_max=*/1);
         auto tgen = std::chrono::steady_clock::now();
         for (int step = 0; step < max_new_tokens; ++step) {
-            const auto logits = lm_fwd.logits_for_hidden(cur_hidden);
+            const float * logits = llama_get_logits_ith(lctx, -1);
+            if (!logits) throw std::runtime_error("logits null at step " + std::to_string(step));
             int32_t best = 0; float bv = logits[0];
-            for (int32_t v = 1; v < static_cast<int32_t>(logits.size()); ++v)
+            for (int32_t v = 1; v < V; ++v)
                 if (logits[v] > bv) { bv = logits[v]; best = v; }
-            if (step == 0 && best == sp.im_end) {
-                int32_t alt = -1; float av = -std::numeric_limits<float>::infinity();
-                for (int32_t v = 0; v < static_cast<int32_t>(logits.size()); ++v)
-                    if (v != sp.im_end && logits[v] > av) { av = logits[v]; alt = v; }
-                if (alt >= 0) best = alt;
-            }
             gen_tokens.push_back(best);
-            if (best == sp.im_end) break;
-            const auto emb = lm_fwd.embed_for_token(best);
-            cur_hidden = lm_fwd.decode_step(gen_cache, emb,
-                                            static_cast<int32_t>(n_prefix + step));
+            if (best == sp.im_end || best == sp.eos) break;
+
+            bat.n_tokens          = 1;
+            bat.token[0]          = best;
+            bat.pos[0]            = n_past++;
+            bat.n_seq_id[0]       = 1;
+            bat.seq_id[0][0]      = 0;
+            bat.logits[0]         = 1;
+            if (llama_decode(lctx, bat) != 0)
+                throw std::runtime_error("llama_decode failed at step " + std::to_string(step));
         }
         std::cout << "  ✓ AR decode " << gen_tokens.size() << " tokens in "
                   << std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::steady_clock::now() - tgen).count() << "s\n";
+        llama_batch_free(bat);
         gen_text = tokz->detokenize(gen_tokens);
 
-        // Extract phrases between object_ref_start / object_ref_end.
+        // --- Extract phrases between object_ref_start / object_ref_end.
+        // Also record each phrase's ref_end position (in the seq 0 KV) so
+        // we can branch and inject there for per-phrase seg extraction.
+        std::vector<llama_pos> phrase_ref_end_pos;
         for (size_t i = 0; i < gen_tokens.size(); ++i) {
             if (gen_tokens[i] == sp.object_ref_start) {
                 size_t j = i + 1;
@@ -547,6 +591,8 @@ int main(int argc, char ** argv) {
                                              gen_tokens.begin() + j);
                     phrases.push_back(tokz->detokenize(mid));
                     phrase_tokens.push_back(mid);
+                    // gen_tokens[j] = ref_end lives at KV position n_past_prefill + j
+                    phrase_ref_end_pos.push_back(n_past_prefill + static_cast<llama_pos>(j));
                 }
                 i = j;
             }
@@ -558,38 +604,92 @@ int main(int argc, char ** argv) {
         }
         std::cout << "\n";
 
-        // No phrases → LM didn't route to segmentation. Print the text and
-        // exit cleanly; no masks to produce.
         if (phrases.empty()) {
             std::cout << "\n=== LM response ===\n" << gen_text << "\n\n"
                          "(no <|object_ref_start|> markers in output — the LM did not\n"
                          "interpret this query as a segmentation task. No masks written.)\n";
+            mtmd_input_chunks_free(chunks);
+            mtmd_bitmap_free(bmw.bitmap);
+            mtmd_free(mctx);
+            llama_free(lctx);
+            llama_model_free(lm_model);
             return 0;
         }
 
-        // Compute seg_output_embeddings per phrase via the injection path.
-        std::vector<int64_t> mq_s, ms_s, me_s;
-        const auto mask_queries = read_bin_f32("/tmp/pathA_reference/instructsam_mask_queries.f32",   mq_s);
-        const auto mask_start   = read_bin_f32("/tmp/pathA_reference/instructsam_mask_start_embed.f32", ms_s);
-        const auto mask_end     = read_bin_f32("/tmp/pathA_reference/instructsam_mask_end_embed.f32",   me_s);
-        for (size_t pi = 0; pi < phrases.size(); ++pi) {
-            std::vector<int32_t> appended = {sp.object_ref_start};
-            for (int32_t t : phrase_tokens[pi]) appended.push_back(t);
-            appended.push_back(sp.object_ref_end);
-            std::vector<float> ap_embeds(appended.size() * H);
-            for (size_t i = 0; i < appended.size(); ++i) {
-                const auto e = lm_fwd.embed_for_token(appended[i]);
-                std::memcpy(ap_embeds.data() + i * H, e.data(), H * sizeof(float));
-            }
-            auto tphr = std::chrono::steady_clock::now();
-            auto so = lm_fwd.extract_seg_output_embeddings_with_cache(
-                prefix_cache, ap_embeds, static_cast<int64_t>(appended.size()),
-                mask_queries, mask_start, mask_end);
-            seg_outs.push_back(std::move(so));
-            std::cout << "  ✓ seg_output for \"" << phrases[pi] << "\" ("
-                      << std::chrono::duration_cast<std::chrono::seconds>(
-                             std::chrono::steady_clock::now() - tphr).count() << "s)\n";
+        // --- Per-phrase seg-output extraction via KV branching + embd batch.
+        //
+        // Strategy: seq 0 already holds prefill + all AR-generated tokens.
+        // For each phrase, branch seq 0 → seq 1 (llama_memory_seq_cp only
+        // supports full-buffer copies), then trim seq 1 back to just past
+        // the phrase's ref_end. Push a 12-embd batch on seq 1:
+        //   [mask_start, mask_queries×10, mask_end]
+        // starting at position (ref_end_pos + 1). Read the 10 mask_query
+        // hidden states via llama_get_embeddings_ith — these are the
+        // seg_output_embeddings that feed mask_hidden_fcs → DETR.
+        std::vector<int64_t> mq_s;
+        const auto mask_queries = read_bin_f32("/tmp/pathA_reference/instructsam_mask_queries.f32", mq_s);
+        if (mask_queries.size() != static_cast<size_t>(10 * H)) {
+            throw std::runtime_error("mask_queries size mismatch: got " +
+                std::to_string(mask_queries.size()) + " expected " + std::to_string(10 * H));
         }
+        const auto mask_start_embed = lm_fwd.embed_for_token(sp.mask_start);
+        const auto mask_end_embed   = lm_fwd.embed_for_token(sp.mask_end);
+
+        llama_memory_t mem = llama_get_memory(lctx);
+        for (size_t pi = 0; pi < phrases.size(); ++pi) {
+            auto tphr = std::chrono::steady_clock::now();
+            const llama_pos ref_end_pos = phrase_ref_end_pos[pi];
+
+            // Branch seq 0 → seq 1 (full copy), then trim tail past ref_end.
+            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
+            llama_memory_seq_cp(mem, /*src=*/0, /*dst=*/1, /*p0=*/0, /*p1=*/-1);
+            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/ref_end_pos + 1, /*p1=*/-1);
+
+            // 12-slot embd batch: [mask_start, mask_queries×10, mask_end].
+            const int32_t n_inject = 12;
+            llama_batch pb = llama_batch_init(n_inject, H, 1);
+            std::memcpy(pb.embd + 0 * H, mask_start_embed.data(), H * sizeof(float));
+            for (int j = 0; j < 10; ++j) {
+                std::memcpy(pb.embd + (1 + j) * H, mask_queries.data() + j * H,
+                            H * sizeof(float));
+            }
+            std::memcpy(pb.embd + 11 * H, mask_end_embed.data(), H * sizeof(float));
+
+            for (int i = 0; i < n_inject; ++i) {
+                pb.pos[i]       = ref_end_pos + 1 + i;
+                pb.n_seq_id[i]  = 1;
+                pb.seq_id[i][0] = 1;
+                pb.logits[i]    = (i >= 1 && i <= 10) ? 1 : 0;   // mask_queries only
+            }
+            pb.n_tokens = n_inject;
+
+            if (llama_decode(lctx, pb) != 0)
+                throw std::runtime_error("llama_decode (seg inject) failed for phrase " +
+                                          std::to_string(pi));
+
+            std::vector<float> seg_out(10 * H);
+            for (int j = 0; j < 10; ++j) {
+                const float * hs = llama_get_embeddings_ith(lctx, j);
+                if (!hs) throw std::runtime_error("seg embed null slot " +
+                                                   std::to_string(j) + " phrase " +
+                                                   std::to_string(pi));
+                std::memcpy(seg_out.data() + j * H, hs, H * sizeof(float));
+            }
+            seg_outs.push_back(std::move(seg_out));
+            llama_batch_free(pb);
+
+            std::cout << "  ✓ seg_output for \"" << phrases[pi] << "\" ("
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - tphr).count() << "ms)\n";
+        }
+
+        // Cleanup mtmd/llama — the rest of the pipeline uses lm_fwd (embed
+        // table only) and downstream native tensors.
+        mtmd_input_chunks_free(chunks);
+        mtmd_bitmap_free(bmw.bitmap);
+        mtmd_free(mctx);
+        llama_free(lctx);
+        llama_model_free(lm_model);
     }
 
     // ── DETR chain per object ──────────────────────────────────────────
