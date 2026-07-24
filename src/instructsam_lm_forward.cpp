@@ -61,6 +61,22 @@ std::vector<ggml_fp16_t> get_f16(const GgufModel & model, const std::string & na
     return v;
 }
 
+// Read a weight tensor as raw bytes with its native ggml_type — supports
+// any quant. Caller passes to cpu_linear along with the ggml_type + shape.
+struct TypedWeight {
+    std::vector<uint8_t> bytes;
+    ggml_type type;
+};
+TypedWeight get_typed(const GgufModel & model, const std::string & name) {
+    ggml_tensor * t = require_tensor(model, name);
+    const size_t sz = ggml_nbytes(t);
+    TypedWeight w;
+    w.type = t->type;
+    w.bytes.resize(sz);
+    ggml_backend_tensor_get(t, w.bytes.data(), 0, sz);
+    return w;
+}
+
 // ── CPU primitives ──────────────────────────────────────────────────────
 
 // RMSNorm on [N, D] with per-D weight vector [D].
@@ -166,6 +182,18 @@ std::vector<float> cpu_linear(
     return cpu_linear_impl(x, N, D_in, D_out, GGML_TYPE_F16, w.data(), b);
 }
 
+// Generic typed-weight overload — F16, Q4_K, Q6_K, Q8_0 etc. all supported.
+// The weight bytes are pointer-aliased into the ggml context; ggml_mul_mat
+// picks the right dequant SIMD kernel based on the type. This is the path
+// that unlocks 4-bit-quant inference.
+std::vector<float> cpu_linear(
+    const std::vector<float> & x, int64_t N, int64_t D_in, int64_t D_out,
+    const TypedWeight & w,
+    const std::vector<float> * b = nullptr
+) {
+    return cpu_linear_impl(x, N, D_in, D_out, w.type, w.bytes.data(), b);
+}
+
 // SwiGLU: silu(gate) * up, then down_proj.
 void cpu_silu_mul(std::vector<float> & gate, const std::vector<float> & up) {
     // silu(x) = x * sigmoid(x)
@@ -214,29 +242,30 @@ void cpu_rope_1d_half(
 }
 
 // ── Per-layer weights bundle (loaded once per layer per forward) ────────
-// Norms stay F32 (they are F32 in the GGUF). Matmul weights kept AS F16
-// straight from the GGUF — no dequant on load; ggml's mul_mat does F16→F32
-// SIMD dequant per lane at compute time, halving weight-streaming bandwidth.
+// Norms stay F32. Matmul weights carry their native GGUF type — F16 for
+// f16-quant GGUFs, Q4_K/Q6_K mixed for k-quant GGUFs. ggml's mul_mat kernel
+// picks the right SIMD dequant per lane at compute time; we just pass
+// (type, bytes) straight through.
 struct LayerWeights {
-    std::vector<float>        attn_norm_w, ffn_norm_w, q_norm_w, k_norm_w;
-    std::vector<ggml_fp16_t>  attn_q_w, attn_k_w, attn_v_w, attn_o_w;
-    std::vector<ggml_fp16_t>  ffn_gate_w, ffn_up_w, ffn_down_w;
+    std::vector<float>  attn_norm_w, ffn_norm_w, q_norm_w, k_norm_w;
+    TypedWeight         attn_q_w, attn_k_w, attn_v_w, attn_o_w;
+    TypedWeight         ffn_gate_w, ffn_up_w, ffn_down_w;
 };
 
 LayerWeights load_layer_weights(const GgufModel & model, int layer) {
     const std::string p = "blk." + std::to_string(layer);
     LayerWeights w;
     w.attn_norm_w = get_f32(model, p + ".attn_norm.weight",   kHiddenSize);
-    w.attn_q_w    = get_f16(model, p + ".attn_q.weight",      kHiddenSize * kHiddenSize);
-    w.attn_k_w    = get_f16(model, p + ".attn_k.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
-    w.attn_v_w    = get_f16(model, p + ".attn_v.weight",      kNumKvHeads * kHeadDim * kHiddenSize);
-    w.attn_o_w    = get_f16(model, p + ".attn_output.weight", kHiddenSize * kHiddenSize);
+    w.attn_q_w    = get_typed(model, p + ".attn_q.weight");
+    w.attn_k_w    = get_typed(model, p + ".attn_k.weight");
+    w.attn_v_w    = get_typed(model, p + ".attn_v.weight");
+    w.attn_o_w    = get_typed(model, p + ".attn_output.weight");
     w.q_norm_w    = get_f32(model, p + ".attn_q_norm.weight", kHeadDim);
     w.k_norm_w    = get_f32(model, p + ".attn_k_norm.weight", kHeadDim);
     w.ffn_norm_w  = get_f32(model, p + ".ffn_norm.weight",    kHiddenSize);
-    w.ffn_gate_w  = get_f16(model, p + ".ffn_gate.weight",    kIntermediate * kHiddenSize);
-    w.ffn_up_w    = get_f16(model, p + ".ffn_up.weight",      kIntermediate * kHiddenSize);
-    w.ffn_down_w  = get_f16(model, p + ".ffn_down.weight",    kHiddenSize * kIntermediate);
+    w.ffn_gate_w  = get_typed(model, p + ".ffn_gate.weight");
+    w.ffn_up_w    = get_typed(model, p + ".ffn_up.weight");
+    w.ffn_down_w  = get_typed(model, p + ".ffn_down.weight");
     return w;
 }
 
