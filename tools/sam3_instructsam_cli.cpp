@@ -141,6 +141,109 @@ std::vector<float> cpu_layer_norm(
     return out;
 }
 
+// y[k, o] = sum_i x[k, i] * W[o, i] + b[o]  — matches PyTorch nn.Linear.
+// x [N, in], W [out, in], b [out] → out [N, out].
+std::vector<float> cpu_linear(
+    const std::vector<float> & x, int64_t N, int64_t D_in,
+    const std::vector<float> & W, const std::vector<float> & b, int64_t D_out
+) {
+    std::vector<float> out(N * D_out);
+    for (int64_t k = 0; k < N; ++k) {
+        for (int64_t o = 0; o < D_out; ++o) {
+            double s = b[o];
+            const float * xr = x.data() + k * D_in;
+            const float * wr = W.data() + o * D_in;
+            for (int64_t i = 0; i < D_in; ++i) s += xr[i] * wr[i];
+            out[k * D_out + o] = static_cast<float>(s);
+        }
+    }
+    return out;
+}
+
+// InstructSAM's Sam3DotProductScoring: classification head that scores
+// each of the 10 decoder queries against the pooled text prompt.
+//
+//   text_features:    [T, H]  from text_hidden_fcs
+//   text_mask:        [T]     1.0 = valid, 0.0 = pad
+//   decoder_queries:  [Q, H]  last-layer DETR decoder output (post output_layer_norm)
+//
+// Returns [Q] pre-sigmoid pred_logits.
+struct DotProdScoringWeights {
+    // text_mlp: Linear(H→intermediate) + ReLU + Linear(intermediate→H)
+    std::vector<float> tm_l1_w, tm_l1_b;    // [intermediate, H], [intermediate]
+    std::vector<float> tm_l2_w, tm_l2_b;    // [H, intermediate], [H]
+    std::vector<float> tm_out_ln_w, tm_out_ln_b;   // [H], [H]
+    std::vector<float> text_proj_w, text_proj_b;   // [H, H], [H]
+    std::vector<float> query_proj_w, query_proj_b; // [H, H], [H]
+    int64_t H = 256;
+    int64_t intermediate = 2048;
+};
+
+DotProdScoringWeights load_scoring_weights(const sam3::GgufModel & grounding) {
+    DotProdScoringWeights w;
+    w.tm_l1_w      = get_f32(grounding, "dot_prod_scoring.text_mlp.layer1.weight", 2048 * 256);
+    w.tm_l1_b      = get_f32(grounding, "dot_prod_scoring.text_mlp.layer1.bias",   2048);
+    w.tm_l2_w      = get_f32(grounding, "dot_prod_scoring.text_mlp.layer2.weight", 256 * 2048);
+    w.tm_l2_b      = get_f32(grounding, "dot_prod_scoring.text_mlp.layer2.bias",   256);
+    w.tm_out_ln_w  = get_f32(grounding, "dot_prod_scoring.text_mlp_out_norm.weight", 256);
+    w.tm_out_ln_b  = get_f32(grounding, "dot_prod_scoring.text_mlp_out_norm.bias",   256);
+    w.text_proj_w  = get_f32(grounding, "dot_prod_scoring.text_proj.weight", 256 * 256);
+    w.text_proj_b  = get_f32(grounding, "dot_prod_scoring.text_proj.bias",   256);
+    w.query_proj_w = get_f32(grounding, "dot_prod_scoring.query_proj.weight", 256 * 256);
+    w.query_proj_b = get_f32(grounding, "dot_prod_scoring.query_proj.bias",   256);
+    return w;
+}
+
+std::vector<float> dot_prod_scoring(
+    const DotProdScoringWeights & w,
+    const std::vector<float> & text_features,   // [T, H]
+    const std::vector<float> & text_mask,       // [T]
+    const std::vector<float> & decoder_queries  // [Q, H]
+) {
+    const int64_t T = static_cast<int64_t>(text_mask.size());
+    const int64_t H = w.H;
+    const int64_t Q = static_cast<int64_t>(decoder_queries.size() / H);
+
+    // text_features = text_mlp_out_norm(text_features + text_mlp(text_features))
+    const auto tm1 = cpu_linear(text_features, T, H, w.tm_l1_w, w.tm_l1_b, w.intermediate);
+    std::vector<float> tm1_relu(tm1.size());
+    for (size_t i = 0; i < tm1.size(); ++i) tm1_relu[i] = std::max(0.0f, tm1[i]);
+    const auto tm2 = cpu_linear(tm1_relu, T, w.intermediate, w.tm_l2_w, w.tm_l2_b, H);
+    std::vector<float> tf_res(text_features.size());
+    for (size_t i = 0; i < tf_res.size(); ++i) tf_res[i] = text_features[i] + tm2[i];
+    const auto tf_norm = cpu_layer_norm(tf_res, T, H, w.tm_out_ln_w, w.tm_out_ln_b);
+
+    // mean-pool over valid text tokens
+    std::vector<float> pooled(H, 0.0f);
+    double n_valid = 0.0;
+    for (int64_t t = 0; t < T; ++t) {
+        const float m = text_mask[t];
+        if (m == 0.0f) continue;
+        n_valid += m;
+        for (int64_t d = 0; d < H; ++d) pooled[d] += m * tf_norm[t * H + d];
+    }
+    if (n_valid < 1.0) n_valid = 1.0;
+    for (int64_t d = 0; d < H; ++d) pooled[d] = static_cast<float>(pooled[d] / n_valid);
+
+    // proj_text = text_proj(pooled); shape [H]
+    const auto proj_text = cpu_linear(pooled, 1, H, w.text_proj_w, w.text_proj_b, H);
+    // proj_queries = query_proj(decoder_queries); shape [Q, H]
+    const auto proj_queries = cpu_linear(decoder_queries, Q, H, w.query_proj_w, w.query_proj_b, H);
+
+    // scores[q] = (proj_queries[q] · proj_text) * scale, clamped to ±12.
+    const float scale = 1.0f / std::sqrt(static_cast<float>(H));
+    std::vector<float> scores(Q);
+    for (int64_t q = 0; q < Q; ++q) {
+        double s = 0.0;
+        for (int64_t d = 0; d < H; ++d) s += proj_queries[q * H + d] * proj_text[d];
+        s *= scale;
+        if (s >  12.0) s =  12.0;
+        if (s < -12.0) s = -12.0;
+        scores[q] = static_cast<float>(s);
+    }
+    return scores;
+}
+
 // ── Mask upsampling + PNG output ────────────────────────────────────────
 
 // Sigmoid + bilinear resize a [288, 288] mask logit tensor to the input
@@ -717,8 +820,14 @@ int main(int argc, char ** argv) {
               << "    qpos_L0    [10, 256] first=[" << qpos_L0[0] << ", "
                   << qpos_L0[1] << ", " << qpos_L0[2] << "]\n";
 
+    // Scoring head — one call per phrase gives us 10 real cls_scores so we
+    // can pick each phrase's best mask slot properly instead of falling back
+    // to peak-mask-sigmoid.
+    const auto dp_w = load_scoring_weights(grounding);
+
     std::cout << "\n=== stage 4: DETR chain per object ===\n";
     std::vector<std::vector<float>> per_obj_masks;
+    std::vector<std::vector<float>> per_obj_cls_scores;   // sigmoid-space, [N][10]
     for (size_t pi = 0; pi < phrases.size(); ++pi) {
         const std::string odir = ref_dir + "/binaries_obj" + std::to_string(pi);
         (void)odir;  // no per-obj ref files needed anymore
@@ -782,9 +891,20 @@ int main(int argc, char ** argv) {
                                          bb2_local, {256, 72, 72});
         const auto out = tail.run(pixel_embed, {256, 288, 288}, decoder_queries, {10, 256});
 
+        // Real cls_score via Sam3DotProductScoring on the last-layer
+        // decoder queries + phrase text_features.
+        const auto pred_logits = dot_prod_scoring(dp_w, text_features, text_mask, decoder_queries);
+        std::vector<float> cls_score(10);
+        for (int s = 0; s < 10; ++s) cls_score[s] = 1.0f / (1.0f + std::exp(-pred_logits[s]));
+        per_obj_cls_scores.push_back(cls_score);
+
         per_obj_masks.push_back(out.pred_masks);
         std::cout << "  ✓ obj " << pi << " (\"" << phrases[pi] << "\"): pred_masks ["
-                  << (out.pred_masks.size() / (288*288)) << ", 288, 288]\n";
+                  << (out.pred_masks.size() / (288*288)) << ", 288, 288]"
+                  << "  cls_score top=[";
+        int top = 0; float tv = cls_score[0];
+        for (int s = 1; s < 10; ++s) if (cls_score[s] > tv) { tv = cls_score[s]; top = s; }
+        std::cout << "slot " << top << " → " << tv << "]\n";
     }
 
     // ── Write raw f32 blob + per-object PNGs + overlay panel ────────────
@@ -803,22 +923,17 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    // Pick each phrase's best mask slot by peak sigmoid activation (proxy
-    // for cls_score — we don't currently emit cls_score from the DETR chain).
+    // Pick each phrase's best mask slot by argmax over cls_score (sigmoid
+    // of pred_logits from Sam3DotProductScoring, computed above in stage 4).
     std::vector<std::vector<uint8_t>> per_obj_binary;
     per_obj_binary.reserve(phrases.size());
     for (size_t pi = 0; pi < phrases.size(); ++pi) {
         const float * m10 = per_obj_masks[pi].data();
-        int best_slot = 0; float best_peak = -1.0f;
-        for (int s = 0; s < 10; ++s) {
-            const float * slot = m10 + s * 288 * 288;
-            float peak = 0.0f;
-            for (int i = 0; i < 288 * 288; ++i) {
-                const float sig = 1.0f / (1.0f + std::exp(-slot[i]));
-                if (sig > peak) peak = sig;
-            }
-            if (peak > best_peak) { best_peak = peak; best_slot = s; }
-        }
+        const auto & cls = per_obj_cls_scores[pi];
+        int best_slot = 0; float best_conf = cls[0];
+        for (int s = 1; s < 10; ++s)
+            if (cls[s] > best_conf) { best_conf = cls[s]; best_slot = s; }
+
         std::vector<float> slot_logits(m10 + best_slot * 288 * 288,
                                        m10 + (best_slot + 1) * 288 * 288);
         auto binary = mask_logits_to_binary(slot_logits, in_h, in_w);
@@ -831,7 +946,7 @@ int main(int argc, char ** argv) {
                       out_dir.c_str(), pi, label_safe.c_str());
         stbi_write_png(buf, in_w, in_h, 1, binary.data(), in_w);
         std::cout << "  ✓ wrote " << buf << "  (slot " << best_slot
-                  << ", peak conf " << best_peak << ")\n";
+                  << ", cls_score " << best_conf << ")\n";
         per_obj_binary.push_back(std::move(binary));
     }
 
