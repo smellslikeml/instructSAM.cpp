@@ -82,7 +82,7 @@ RUN cmake -S /src/llama.cpp -B /src/llama.cpp/build \
         -DGGML_BLAS=OFF -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=OFF \
         -DCMAKE_BUILD_TYPE=Release \
     && cmake --build /src/llama.cpp/build \
-        --target llama common mtmd ggml ggml-cpu ggml-base llama-mtmd-cli \
+        --target llama common mtmd ggml ggml-cpu ggml-base llama-mtmd-cli llama-quantize \
         --parallel "$(nproc)"
 
 # ── Download source safetensors + convert to GGUF ──────────────────────
@@ -115,8 +115,14 @@ RUN mkdir -p /models \
         --outtype f16 \
         /src/instructsam-as-qwen3vl \
     && ./build/bin/llama-quantize \
+        --token-embedding-type f16 \
         /models/instructsam-lm-f16.gguf \
         /models/instructsam-lm-Q4_K_M.gguf Q4_K_M
+# --token-embedding-type f16: llama-quantize's default for Q4_K_M is to
+# downcast token_embd.weight to Q6_K, but sam3-instructsam-cli's
+# InstructsamLmForward::embed_for_token (used to fetch the mask_start /
+# mask_end / phrase-token embeddings that seed the seg-output injection)
+# only supports F32 and F16. Force F16 here so both paths agree.
 
 # Convert vision projector (mmproj).
 RUN cd /src/llama.cpp \
