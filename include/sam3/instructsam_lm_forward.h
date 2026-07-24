@@ -72,6 +72,23 @@ public:
         const std::vector<int32_t> & positions
     ) const;
 
+    // Convenience wrapper for InstructSAM's mask_queries injection.
+    // Given a prompt token sequence (ending with <|object_ref_end|>) and
+    // the 10 mask_queries embeddings, builds the full injected sequence:
+    //   [prompt_tokens..., mask_start, mask_queries[0..9], mask_end]
+    // Runs the forward pass and returns the 10 hidden states at the
+    // mask_queries positions. This is seg_output_embeddings — feeds
+    // directly into InstructsamMaskHiddenFcs → decoder queries.
+    //
+    // mask_queries shape [10, 2048]. mask_start_embed / mask_end_embed
+    // shape [2048] each. Typically extracted from InstructSAM's checkpoint.
+    std::vector<float> extract_seg_output_embeddings(
+        const std::vector<int32_t> & prompt_token_ids,  // must end with <|object_ref_end|>
+        const std::vector<float> & mask_queries,        // [10, 2048]
+        const std::vector<float> & mask_start_embed,    // [2048]
+        const std::vector<float> & mask_end_embed       // [2048]
+    ) const;
+
     // Look up a token's INPUT embedding from token_embd.weight.
     // Handy for building the phrase_embeddings input to text_hidden_fcs
     // (piece 4b). Also for constructing the initial embed sequence in the

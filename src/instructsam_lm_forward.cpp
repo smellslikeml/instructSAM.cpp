@@ -343,4 +343,66 @@ std::vector<float> InstructsamLmForward::run(
     return cpu_rms_norm(hidden, seq_len, kHiddenSize, output_norm_w);
 }
 
+std::vector<float> InstructsamLmForward::extract_seg_output_embeddings(
+    const std::vector<int32_t> & prompt_token_ids,
+    const std::vector<float> & mask_queries,
+    const std::vector<float> & mask_start_embed,
+    const std::vector<float> & mask_end_embed
+) const {
+    if (mask_queries.size() != 10 * kHiddenSize) {
+        throw std::runtime_error("extract_seg_output_embeddings: mask_queries must be [10, 2048]");
+    }
+    if (mask_start_embed.size() != kHiddenSize || mask_end_embed.size() != kHiddenSize) {
+        throw std::runtime_error("extract_seg_output_embeddings: mask_start/end embeds must be [2048]");
+    }
+    if (prompt_token_ids.empty()) {
+        throw std::runtime_error("extract_seg_output_embeddings: empty prompt");
+    }
+
+    const int64_t n_prompt = static_cast<int64_t>(prompt_token_ids.size());
+    // Total sequence: prompt + mask_start + 10 mask_queries + mask_end
+    const int64_t n_inject = 12;
+    const int64_t seq_len = n_prompt + n_inject;
+
+    std::vector<float> embeds(seq_len * kHiddenSize);
+    std::vector<int32_t> positions(seq_len);
+
+    // Prompt token embeddings via LM's embed table
+    for (int64_t i = 0; i < n_prompt; ++i) {
+        const auto e = embed_for_token(prompt_token_ids[static_cast<size_t>(i)]);
+        std::memcpy(embeds.data() + i * kHiddenSize, e.data(), kHiddenSize * sizeof(float));
+        positions[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    }
+
+    // Inject: mask_start
+    std::memcpy(embeds.data() + n_prompt * kHiddenSize,
+                mask_start_embed.data(), kHiddenSize * sizeof(float));
+    positions[static_cast<size_t>(n_prompt)] = static_cast<int32_t>(n_prompt);
+
+    // Inject: 10 mask_queries
+    for (int64_t j = 0; j < 10; ++j) {
+        std::memcpy(embeds.data() + (n_prompt + 1 + j) * kHiddenSize,
+                    mask_queries.data() + j * kHiddenSize,
+                    kHiddenSize * sizeof(float));
+        positions[static_cast<size_t>(n_prompt + 1 + j)] = static_cast<int32_t>(n_prompt + 1 + j);
+    }
+
+    // Inject: mask_end
+    std::memcpy(embeds.data() + (n_prompt + 11) * kHiddenSize,
+                mask_end_embed.data(), kHiddenSize * sizeof(float));
+    positions[static_cast<size_t>(n_prompt + 11)] = static_cast<int32_t>(n_prompt + 11);
+
+    // Full forward
+    const auto final_hidden = run(embeds, seq_len, positions);
+
+    // Extract the 10 mask_queries hidden states at positions [n_prompt+1 .. n_prompt+10]
+    std::vector<float> seg_out(10 * kHiddenSize);
+    for (int64_t j = 0; j < 10; ++j) {
+        std::memcpy(seg_out.data() + j * kHiddenSize,
+                    final_hidden.data() + (n_prompt + 1 + j) * kHiddenSize,
+                    kHiddenSize * sizeof(float));
+    }
+    return seg_out;
+}
+
 }  // namespace sam3
