@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # sam3-instructsam — natural-language image segmentation, CPU-only.
 #
 # Builds a self-contained image whose entrypoint is `sam3-instructsam-cli`.
@@ -92,34 +93,19 @@ RUN /opt/convert-venv/bin/python -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('${INSTRUCTSAM_REPO}', local_dir='/src/instructsam-src', local_dir_use_symlinks=False)"
 
-# Rewrite config.json and tokenizer_config.json so llama.cpp's Qwen3-VL
+# Rewrite config.json + tokenizer_config.json so llama.cpp's Qwen3-VL
 # converter sees a vanilla Qwen3VLForConditionalGeneration checkpoint.
-# (Mirrors tools/pathb_convert_lm_mmproj.sh steps 2 + 3.)
-RUN mkdir -p /src/instructsam-as-qwen3vl \
-    && cp /src/instructsam-src/model.safetensors /src/instructsam-as-qwen3vl/ \
-    && cp /src/instructsam-src/tokenizer.json /src/instructsam-as-qwen3vl/ \
-    && cp /src/instructsam-src/chat_template.jinja /src/instructsam-as-qwen3vl/ 2>/dev/null || true \
-    && cp /src/instructsam-src/generation_config.json /src/instructsam-as-qwen3vl/ 2>/dev/null || true \
-    && cp /src/instructsam-src/processor_config.json /src/instructsam-as-qwen3vl/ 2>/dev/null || true \
-    && /opt/convert-venv/bin/python - <<'PY'
-import json
-from pathlib import Path
-src = Path("/src/instructsam-src")
-dst = Path("/src/instructsam-as-qwen3vl")
-cfg = json.loads((src / "config.json").read_text())
-cfg["architectures"] = ["Qwen3VLForConditionalGeneration"]
-for k in ("bce_loss_weight","cls_loss_weight","dice_loss_weight",
-          "loss_sample_points","mask_decoder_model","max_seg_nums",
-          "mm_mask_decoder","out_dim",
-          "ref_end_token_index","ref_start_token_index",
-          "region_token_index","seg_decoder","seg_encoder",
-          "seg_end_token_index","seg_start_token_index","seg_token_index"):
-    cfg.pop(k, None)
-(dst / "config.json").write_text(json.dumps(cfg, indent=2))
-tok = json.loads((src / "tokenizer_config.json").read_text())
-tok["extra_special_tokens"] = {}
-(dst / "tokenizer_config.json").write_text(json.dumps(tok, indent=2))
-PY
+# (Mirrors tools/pathb_convert_lm_mmproj.sh steps 2 + 3. Actual rewrite
+# logic lives in docker/rewrite_config_for_qwen3vl.py which we already
+# COPYed in as part of /src/sam3cpp.)
+RUN mkdir -p /src/instructsam-as-qwen3vl && \
+    cp /src/instructsam-src/model.safetensors  /src/instructsam-as-qwen3vl/ && \
+    cp /src/instructsam-src/tokenizer.json     /src/instructsam-as-qwen3vl/ && \
+    for f in chat_template.jinja generation_config.json processor_config.json; do \
+        [ -f "/src/instructsam-src/$f" ] && cp "/src/instructsam-src/$f" /src/instructsam-as-qwen3vl/ ; \
+    done && \
+    /opt/convert-venv/bin/python /src/sam3cpp/docker/rewrite_config_for_qwen3vl.py \
+        /src/instructsam-src /src/instructsam-as-qwen3vl
 
 # Convert LM half (f16 for accuracy) + Q4_K_M quant (default runtime).
 RUN mkdir -p /models \
