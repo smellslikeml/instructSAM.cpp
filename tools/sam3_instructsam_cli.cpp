@@ -29,6 +29,7 @@
 #include "sam3/instructsam_pixel_decoder.h"
 #include "sam3/instructsam_preprocess.h"
 #include "sam3/instructsam_prompt_cross_attn.h"
+#include "sam3/instructsam_vision_encoder.h"
 #include "sam3/instructsam_tokenizer.h"
 #include "sam3/instructsam_vision_encoder.h"
 
@@ -315,22 +316,33 @@ int main(int argc, char ** argv) {
     std::cout << "  ✓ pixel_values [3, 1008, 1008] loaded\n";
 
     // ── Vision: SAM3 encoder trunk + FPN neck ────────────────────────────
-    std::vector<float> bb0, bb1, bb2_hwc;
+    std::vector<float> bb0, bb1, bb2;
     if (use_cached_vision) {
         std::cout << "\n=== stage 2: vision (using cached backbone_features) ===\n";
         std::vector<int64_t> s0, s1, sflat;
         bb0 = read_bin_f32(ref_dir + "/binaries_obj0/md_fpn_bb0.f32", s0);
         bb1 = read_bin_f32(ref_dir + "/binaries_obj0/md_fpn_bb1.f32", s1);
-        bb2_hwc = read_bin_f32(ref_dir + "/binaries_obj0/enc_vision_features_flat.f32", sflat);
+        const auto bb2_hwc = read_bin_f32(ref_dir + "/binaries_obj0/enc_vision_features_flat.f32", sflat);
+        // Reshape bb2 to [256, 72, 72] channels-first for FPN input
+        bb2.assign(256 * 72 * 72, 0.0f);
+        for (int t = 0; t < 5184; ++t)
+            for (int c = 0; c < 256; ++c) bb2[c * 5184 + t] = bb2_hwc[t * 256 + c];
     } else {
-        std::cout << "\n=== stage 2: vision — full SAM3 encoder (~25 min CPU) ===\n";
-        std::cerr << "  --run-vision not yet wired in this CLI; use --use-cached-vision\n";
-        return 4;
-    }
-    // Reshape bb2 back to [256, 72, 72] channels-first for FPN
-    std::vector<float> bb2(256 * 72 * 72);
-    for (int t = 0; t < 5184; ++t) {
-        for (int c = 0; c < 256; ++c) bb2[c * 5184 + t] = bb2_hwc[t * 256 + c];
+        std::cout << "\n=== stage 2: vision — full SAM3 encoder (32 layers + FPN neck) ===\n" << std::flush;
+        sam3::InstructsamVisionEncoder vis(grounding);
+        auto tvis = std::chrono::steady_clock::now();
+        const auto trunk = vis.run_all_layers(pv, {3, 1008, 1008});
+        std::cout << "  ✓ trunk (32 layers) in "
+                  << std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - tvis).count() << "s\n" << std::flush;
+        auto tneck = std::chrono::steady_clock::now();
+        const auto fpn = vis.run_neck(trunk);
+        std::cout << "  ✓ FPN neck (3 levels) in "
+                  << std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - tneck).count() << "s\n";
+        bb0 = std::move(fpn.bb0);
+        bb1 = std::move(fpn.bb1);
+        bb2 = std::move(fpn.bb2);
     }
 
     // ── LM path: two modes ──────────────────────────────────────────────

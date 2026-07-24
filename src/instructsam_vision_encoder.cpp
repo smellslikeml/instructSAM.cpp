@@ -1,9 +1,12 @@
 #include "sam3/instructsam_vision_encoder.h"
 
+#include "sam3/detail/cpu_linear.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -573,10 +576,14 @@ std::vector<float> InstructsamVisionEncoder::run_all_layers(
     const std::vector<float> & pixel_values,
     const std::vector<int64_t> & pixel_shape
 ) const {
-    // Patch embed + pos embed + pre-trunk LN → [72*72, 1024]
     auto hidden = run_prenorm(pixel_values, pixel_shape);
+    auto tstart = std::chrono::steady_clock::now();
     for (int layer = 0; layer < kNumLayers; ++layer) {
+        auto tl = std::chrono::steady_clock::now();
         hidden = run_layer(layer, hidden);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - tl).count();
+        fprintf(stderr, "  [vis] layer %d done (%lld ms)\n", layer, (long long)ms); fflush(stderr);
     }
     return hidden;
 }
@@ -650,28 +657,24 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
     const auto ow = get_f32(p + ".attention.o_proj.weight", kHiddenSize * kHiddenSize);
     const auto ob = get_f32(p + ".attention.o_proj.bias",   kHiddenSize);
 
-    auto cpu_linear = [](const std::vector<float> & x, int64_t N,
-                         int64_t D_in, int64_t D_out,
-                         const std::vector<float> & w,
-                         const std::vector<float> & b) {
-        std::vector<float> y(static_cast<size_t>(N * D_out));
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t o = 0; o < D_out; ++o) {
-                float s = b[static_cast<size_t>(o)];
-                for (int64_t k = 0; k < D_in; ++k) {
-                    s += w[static_cast<size_t>(o * D_in + k)] *
-                         x[static_cast<size_t>(n * D_in + k)];
-                }
-                y[static_cast<size_t>(n * D_out + o)] = s;
-            }
-        }
-        return y;
-    };
+    using detail::cpu_linear;
 
     const int64_t total_tokens = num_windows * seq_per_win;
-    auto Q = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, qw, qb);
-    auto K = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, kw, kb);
-    auto V = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, vw, vb);
+    auto Q = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, qw, nullptr);
+    #pragma omp parallel for schedule(static)
+    for (int64_t n = 0; n < total_tokens; ++n)
+        for (int64_t d = 0; d < kHiddenSize; ++d)
+            Q[n * kHiddenSize + d] += qb[d];
+    auto K = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, kw, nullptr);
+    #pragma omp parallel for schedule(static)
+    for (int64_t n = 0; n < total_tokens; ++n)
+        for (int64_t d = 0; d < kHiddenSize; ++d)
+            K[n * kHiddenSize + d] += kb[d];
+    auto V = cpu_linear(windowed, total_tokens, kHiddenSize, kHiddenSize, vw, nullptr);
+    #pragma omp parallel for schedule(static)
+    for (int64_t n = 0; n < total_tokens; ++n)
+        for (int64_t d = 0; d < kHiddenSize; ++d)
+            V[n * kHiddenSize + d] += vb[d];
 
     // Transpose to [num_windows, num_heads, seq_per_win, head_dim] for RoPE + attention
     auto to_heads = [&](const std::vector<float> & flat) {
@@ -699,6 +702,8 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
     // Scaled dot-product attention CPU-side (small compute — batched over windows/heads).
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     std::vector<float> attn(static_cast<size_t>(total_tokens * kHiddenSize));
+    // Parallelize across (window, head) — each is independent.
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t b = 0; b < num_windows; ++b) {
         for (int64_t h = 0; h < kNumHeads; ++h) {
             const float * qh = Q.data() + ((b * kNumHeads + h) * seq_per_win) * kHeadDim;
@@ -735,7 +740,10 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
         }
     }
 
-    auto attn_proj = cpu_linear(attn, total_tokens, kHiddenSize, kHiddenSize, ow, ob);
+    auto attn_proj = cpu_linear(attn, total_tokens, kHiddenSize, kHiddenSize, ow, nullptr);
+    for (int64_t n = 0; n < total_tokens; ++n)
+        for (int64_t d = 0; d < kHiddenSize; ++d)
+            attn_proj[n * kHiddenSize + d] += ob[d];
 
     std::vector<float> attn_unwin = global
         ? std::move(attn_proj)
@@ -751,11 +759,17 @@ std::vector<float> InstructsamVisionEncoder::run_layer(
     const auto fc2_w = get_f32(p + ".mlp.fc2.weight", kHiddenSize * kMlpDim);
     const auto fc2_b = get_f32(p + ".mlp.fc2.bias",   kHiddenSize);
 
-    auto mlp_mid = cpu_linear(ln2_out, kNumPatches, kHiddenSize, kMlpDim, fc1_w, fc1_b);
+    auto mlp_mid = cpu_linear(ln2_out, kNumPatches, kHiddenSize, kMlpDim, fc1_w, nullptr);
+    for (int64_t n = 0; n < kNumPatches; ++n)
+        for (int64_t d = 0; d < kMlpDim; ++d)
+            mlp_mid[n * kMlpDim + d] += fc1_b[d];
     for (float & x : mlp_mid) {
         x = 0.5f * x * (1.0f + std::erf(x / std::sqrt(2.0f)));
     }
-    auto mlp_out = cpu_linear(mlp_mid, kNumPatches, kMlpDim, kHiddenSize, fc2_w, fc2_b);
+    auto mlp_out = cpu_linear(mlp_mid, kNumPatches, kMlpDim, kHiddenSize, fc2_w, nullptr);
+    for (int64_t n = 0; n < kNumPatches; ++n)
+        for (int64_t d = 0; d < kHiddenSize; ++d)
+            mlp_out[n * kHiddenSize + d] += fc2_b[d];
 
     for (size_t i = 0; i < mlp_out.size(); ++i) mlp_out[i] += residual2[i];
     return mlp_out;
