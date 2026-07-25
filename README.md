@@ -56,10 +56,6 @@ Four artifacts, all converted at Docker build time (or via
 - `instructsam-grounding-f16.gguf` — DETR + FPN + mask decoder + scoring head (~1 GB)
 - `instructsam_mask_queries.f32` — learned mask-query template embeddings (~80 KB)
 
-## Contributing
-
-See [`REVIEW.md`](REVIEW.md) for review conventions and [`CONTRIBUTING.md`](CONTRIBUTING.md)
-for general contribution guidance.
 
 ## License
 
