@@ -607,7 +607,14 @@ int main(int argc, char ** argv) {
         cp.n_ctx           = 4096;
         cp.n_batch         = 1024;
         cp.n_ubatch        = 1024;
-        cp.n_seq_max       = 2;                          // seq 0 for AR, seq 1 for per-phrase seg injection
+        cp.n_seq_max       = 2;                          // seq 0 for AR, seq 1 for per-phrase seg
+                                                         // injection. NOTE: llama's sched_reserve caps
+                                                         // worst-case n_outputs to n_seq_max at context
+                                                         // init, so our 12-slot seg-inject silently
+                                                         // returns NaN for slots 2..9. Bumping to
+                                                         // n_seq_max=12 fixes the NaN but multiplies
+                                                         // KV-copy cost per seq_cp. See task #368 +
+                                                         // tools/compare_drift.py for the drift analysis.
         cp.embeddings      = true;                       // enable hidden-state readout
         cp.pooling_type    = LLAMA_POOLING_TYPE_NONE;    // per-token, not pooled
         cp.no_perf         = true;
@@ -745,47 +752,84 @@ int main(int argc, char ** argv) {
         const auto mask_end_embed   = lm_fwd.embed_for_token(sp.mask_end);
 
         llama_memory_t mem = llama_get_memory(lctx);
+
         for (size_t pi = 0; pi < phrases.size(); ++pi) {
             auto tphr = std::chrono::steady_clock::now();
             const llama_pos ref_end_pos = phrase_ref_end_pos[pi];
 
-            // Branch seq 0 → seq 1 (full copy), then trim tail past ref_end.
-            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
-            llama_memory_seq_cp(mem, /*src=*/0, /*dst=*/1, /*p0=*/0, /*p1=*/-1);
-            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/ref_end_pos + 1, /*p1=*/-1);
-
-            // 12-slot embd batch: [mask_start, mask_queries×10, mask_end].
-            const int32_t n_inject = 12;
-            llama_batch pb = llama_batch_init(n_inject, H, 1);
-            std::memcpy(pb.embd + 0 * H, mask_start_embed.data(), H * sizeof(float));
-            for (int j = 0; j < 10; ++j) {
-                std::memcpy(pb.embd + (1 + j) * H, mask_queries.data() + j * H,
-                            H * sizeof(float));
-            }
-            std::memcpy(pb.embd + 11 * H, mask_end_embed.data(), H * sizeof(float));
-
-            for (int i = 0; i < n_inject; ++i) {
-                pb.pos[i]       = ref_end_pos + 1 + i;
-                pb.n_seq_id[i]  = 1;
-                pb.seq_id[i][0] = 1;
-                pb.logits[i]    = (i >= 1 && i <= 10) ? 1 : 0;   // mask_queries only
-            }
-            pb.n_tokens = n_inject;
-
-            if (llama_decode(lctx, pb) != 0)
-                throw std::runtime_error("llama_decode (seg inject) failed for phrase " +
-                                          std::to_string(pi));
+            // 5-iteration workaround for llama's sched_reserve output cap.
+            //
+            // Ideal: send a single 12-embd inject batch, mark all 10
+            // mask_query positions, read 10 hidden states in one shot.
+            //
+            // Reality: at context init, llama sizes output-buffer capacity
+            // to `sched_reserve worst-case n_outputs = n_seq_max` (= 2 here).
+            // Batches marking more than n_seq_max outputs silently return
+            // NaN for the excess slots — we lose slots 2..9 to garbage
+            // memory that then cascades through mask_hidden_fcs → DETR
+            // queries → pred_masks. See tools/compare_drift.py.
+            //
+            // Bumping n_seq_max fixes the cap but multiplies KV copy cost
+            // per per_phrase seq_cp by O(n_seq_max), which balloons wall
+            // clock past useful.
+            //
+            // Workaround: 5 iterations × 2 marked outputs each. Each
+            // iteration sends the full 12-embd batch (preserving causal
+            // attention structure so mask_query slot k still sees
+            // mask_queries[0..k-1]), but marks only the 2 slots we want
+            // to read. Output slots 0-1 come back valid; we memcpy into
+            // seg_out at the appropriate position.
+            //
+            // Cost: 5 × per_phrase seg-inject decode instead of 1 (~1 s
+            // extra per phrase on 12-core CPU). Acceptable for parity.
 
             std::vector<float> seg_out(10 * H);
-            for (int j = 0; j < 10; ++j) {
-                const float * hs = llama_get_embeddings_ith(lctx, j);
-                if (!hs) throw std::runtime_error("seg embed null slot " +
-                                                   std::to_string(j) + " phrase " +
-                                                   std::to_string(pi));
-                std::memcpy(seg_out.data() + j * H, hs, H * sizeof(float));
+            for (int iter = 0; iter < 5; ++iter) {
+                // Fresh seq 1 branch of prefill+AR state, trimmed to ref_end.
+                llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
+                llama_memory_seq_cp(mem, /*src=*/0, /*dst=*/1, /*p0=*/0, /*p1=*/-1);
+                llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/ref_end_pos + 1, /*p1=*/-1);
+
+                // 12-slot embd batch: [mask_start, mask_queries×10, mask_end].
+                const int32_t n_inject = 12;
+                llama_batch pb = llama_batch_init(n_inject, H, 1);
+                std::memcpy(pb.embd + 0 * H, mask_start_embed.data(), H * sizeof(float));
+                for (int j = 0; j < 10; ++j) {
+                    std::memcpy(pb.embd + (1 + j) * H, mask_queries.data() + j * H,
+                                H * sizeof(float));
+                }
+                std::memcpy(pb.embd + 11 * H, mask_end_embed.data(), H * sizeof(float));
+
+                const int q0 = 2 * iter;      // mask_query slot 0, 2, 4, 6, 8
+                const int q1 = 2 * iter + 1;  // mask_query slot 1, 3, 5, 7, 9
+                for (int i = 0; i < n_inject; ++i) {
+                    pb.pos[i]       = ref_end_pos + 1 + i;
+                    pb.n_seq_id[i]  = 1;
+                    pb.seq_id[i][0] = 1;
+                    pb.logits[i]    = 0;
+                }
+                pb.logits[1 + q0] = 1;
+                pb.logits[1 + q1] = 1;
+                pb.n_tokens = n_inject;
+
+                if (llama_decode(lctx, pb) != 0)
+                    throw std::runtime_error("llama_decode (seg inject) failed at "
+                                              "iter " + std::to_string(iter) +
+                                              " phrase " + std::to_string(pi));
+
+                // With exactly 2 output-marks and n_seq_max=2 cap, output
+                // slots 0-1 correspond to the 2 marked positions in batch order.
+                for (int k = 0; k < 2; ++k) {
+                    const int slot = 2 * iter + k;
+                    const float * hs = llama_get_embeddings_ith(lctx, k);
+                    if (!hs) throw std::runtime_error("seg embed null at iter " +
+                                                       std::to_string(iter) +
+                                                       " k=" + std::to_string(k));
+                    std::memcpy(seg_out.data() + slot * H, hs, H * sizeof(float));
+                }
+                llama_batch_free(pb);
             }
             seg_outs.push_back(std::move(seg_out));
-            llama_batch_free(pb);
 
             std::cout << "  ✓ seg_output for \"" << phrases[pi] << "\" ("
                       << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -830,6 +874,22 @@ int main(int argc, char ** argv) {
     // can pick each phrase's best mask slot properly instead of falling back
     // to peak-mask-sigmoid.
     const auto dp_w = load_scoring_weights(grounding);
+
+    // Per-stage dump root for the drift-investigation harness. When set,
+    // every DETR-chain intermediate lands as a BIN1 tensor under
+    // <dump_root>/obj<pi>/<stage>.f32 so tools/compare_drift.py can
+    // pair-compare against the reference oracle at
+    // <ref_dir>/binaries_obj<pi>/.
+    const char * dump_root_env = std::getenv("SAM3_CLI_DUMP_INTERMEDIATES");
+    const std::string dump_root = dump_root_env ? dump_root_env : "";
+    if (!dump_root.empty()) {
+        std::filesystem::create_directories(dump_root);
+        write_bin_f32(dump_root + "/md_fpn_bb0.f32", bb0, {256, 288, 288});
+        write_bin_f32(dump_root + "/md_fpn_bb1.f32", bb1, {256, 144, 144});
+        write_bin_f32(dump_root + "/md_fpn_bb2.f32", bb2, {256, 72, 72});
+        std::cout << "  · SAM3_CLI_DUMP_INTERMEDIATES=" << dump_root
+                  << " (per-image bb0/bb1/bb2 dumped)\n";
+    }
 
     std::cout << "\n=== stage 4: DETR chain per object ===\n";
     std::vector<std::vector<float>> per_obj_masks;
@@ -911,6 +971,28 @@ int main(int argc, char ** argv) {
         int top = 0; float tv = cls_score[0];
         for (int s = 1; s < 10; ++s) if (cls_score[s] > tv) { tv = cls_score[s]; top = s; }
         std::cout << "slot " << top << " → " << tv << "]\n";
+
+        // Per-object drift-investigation dumps.
+        if (!dump_root.empty()) {
+            const std::string od = dump_root + "/obj" + std::to_string(pi);
+            std::filesystem::create_directories(od);
+            write_bin_f32(od + "/lmb_seg_output_embeddings.f32", seg_outs[pi], {10, 2048});
+            write_bin_f32(od + "/lmb_mask_hidden_fcs_out.f32", queries_out.data, {10, 256});
+            write_bin_f32(od + "/enc_text_features.f32", text_features, {kPhraseMax, 256});
+            write_bin_f32(od + "/enc_vision_features_flat.f32", vision_features, {5184, 256});
+            write_bin_f32(od + "/detr_encoder_last_hidden.f32", enc_out.last_hidden_state,
+                          {enc_out.vision_seq, enc_out.hidden_dim});
+            for (size_t l = 0; l < dec_out.hs.size(); ++l) {
+                write_bin_f32(od + "/expected_layer_" + std::to_string(l) + ".f32",
+                              dec_out.hs[l], {10, 256});
+            }
+            write_bin_f32(od + "/md_decoder_queries.f32", decoder_queries, {10, 256});
+            write_bin_f32(od + "/md_pca_encoder_in.f32", post_encoder,
+                          {enc_out.vision_seq, enc_out.hidden_dim});
+            write_bin_f32(od + "/md_pixel_embed.f32", pixel_embed, {256, 288, 288});
+            write_bin_f32(od + "/md_pred_masks.f32", out.pred_masks, {10, 288, 288});
+            write_bin_f32(od + "/pred_logits.f32", pred_logits, {10});
+        }
     }
 
     // ── Write raw f32 blob + per-object PNGs + overlay panel ────────────
