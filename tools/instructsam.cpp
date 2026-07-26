@@ -753,78 +753,83 @@ int main(int argc, char ** argv) {
 
         llama_memory_t mem = llama_get_memory(lctx);
 
-        // Warm-up decode to force llama's scheduler to reserve output-buffer
-        // capacity for our 12-slot embd batches. Without this, the scheduler
-        // sizes output storage from the AR-decode pattern (n_outputs=1 per
-        // step, worst-case=2 for our n_seq_max=2), and later 12-output
-        // batches get silently capped — only the first 2-3 output slots come
-        // back with valid embeddings; the rest are NaN. Sending a dummy
-        // 12-token all-marked batch here forces the wider reservation.
-        {
-            llama_batch wb = llama_batch_init(12, H, 1);
-            for (int i = 0; i < 12; ++i) {
-                std::memset(wb.embd + i * H, 0, H * sizeof(float));
-                wb.pos[i]       = 0;
-                wb.n_seq_id[i]  = 1;
-                wb.seq_id[i][0] = 1;
-                wb.logits[i]    = 1;
-            }
-            wb.n_tokens = 12;
-            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
-            (void)llama_decode(lctx, wb);   // ignore result; only priming the scheduler
-            llama_batch_free(wb);
-            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
-        }
-
         for (size_t pi = 0; pi < phrases.size(); ++pi) {
             auto tphr = std::chrono::steady_clock::now();
             const llama_pos ref_end_pos = phrase_ref_end_pos[pi];
 
-            // Branch seq 0 → seq 1 (full copy), then trim tail past ref_end.
-            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
-            llama_memory_seq_cp(mem, /*src=*/0, /*dst=*/1, /*p0=*/0, /*p1=*/-1);
-            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/ref_end_pos + 1, /*p1=*/-1);
+            // 5-iteration workaround for llama's sched_reserve output cap.
+            //
+            // Ideal: send a single 12-embd inject batch, mark all 10
+            // mask_query positions, read 10 hidden states in one shot.
+            //
+            // Reality: at context init, llama sizes output-buffer capacity
+            // to `sched_reserve worst-case n_outputs = n_seq_max` (= 2 here).
+            // Batches marking more than n_seq_max outputs silently return
+            // NaN for the excess slots — we lose slots 2..9 to garbage
+            // memory that then cascades through mask_hidden_fcs → DETR
+            // queries → pred_masks. See tools/compare_drift.py.
+            //
+            // Bumping n_seq_max fixes the cap but multiplies KV copy cost
+            // per per_phrase seq_cp by O(n_seq_max), which balloons wall
+            // clock past useful.
+            //
+            // Workaround: 5 iterations × 2 marked outputs each. Each
+            // iteration sends the full 12-embd batch (preserving causal
+            // attention structure so mask_query slot k still sees
+            // mask_queries[0..k-1]), but marks only the 2 slots we want
+            // to read. Output slots 0-1 come back valid; we memcpy into
+            // seg_out at the appropriate position.
+            //
+            // Cost: 5 × per_phrase seg-inject decode instead of 1 (~1 s
+            // extra per phrase on 12-core CPU). Acceptable for parity.
 
-            // 12-slot embd batch: [mask_start, mask_queries×10, mask_end].
-            const int32_t n_inject = 12;
-            llama_batch pb = llama_batch_init(n_inject, H, 1);
-            std::memcpy(pb.embd + 0 * H, mask_start_embed.data(), H * sizeof(float));
-            for (int j = 0; j < 10; ++j) {
-                std::memcpy(pb.embd + (1 + j) * H, mask_queries.data() + j * H,
-                            H * sizeof(float));
-            }
-            std::memcpy(pb.embd + 11 * H, mask_end_embed.data(), H * sizeof(float));
-
-            for (int i = 0; i < n_inject; ++i) {
-                pb.pos[i]       = ref_end_pos + 1 + i;
-                pb.n_seq_id[i]  = 1;
-                pb.seq_id[i][0] = 1;
-                pb.logits[i]    = 1;   // mark all — llama forces this under
-                                       // `embeddings=true`, marking selectively
-                                       // triggers "overriding" warning + returns
-                                       // uninitialized NaN for silently-dropped
-                                       // slots. See NaN pattern in seg_out for pi=0.
-            }
-            pb.n_tokens = n_inject;
-
-            if (llama_decode(lctx, pb) != 0)
-                throw std::runtime_error("llama_decode (seg inject) failed for phrase " +
-                                          std::to_string(pi));
-
-            // llama_get_embeddings_ith(j) returns the j-th output slot. With
-            // all 12 positions marked, output slots are: 0=mask_start,
-            // 1..10=mask_queries[0..9], 11=mask_end. Read slots 1..10 for the
-            // mask-query hidden states we actually want.
             std::vector<float> seg_out(10 * H);
-            for (int j = 0; j < 10; ++j) {
-                const float * hs = llama_get_embeddings_ith(lctx, 1 + j);
-                if (!hs) throw std::runtime_error("seg embed null slot " +
-                                                   std::to_string(j) + " phrase " +
-                                                   std::to_string(pi));
-                std::memcpy(seg_out.data() + j * H, hs, H * sizeof(float));
+            for (int iter = 0; iter < 5; ++iter) {
+                // Fresh seq 1 branch of prefill+AR state, trimmed to ref_end.
+                llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
+                llama_memory_seq_cp(mem, /*src=*/0, /*dst=*/1, /*p0=*/0, /*p1=*/-1);
+                llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/ref_end_pos + 1, /*p1=*/-1);
+
+                // 12-slot embd batch: [mask_start, mask_queries×10, mask_end].
+                const int32_t n_inject = 12;
+                llama_batch pb = llama_batch_init(n_inject, H, 1);
+                std::memcpy(pb.embd + 0 * H, mask_start_embed.data(), H * sizeof(float));
+                for (int j = 0; j < 10; ++j) {
+                    std::memcpy(pb.embd + (1 + j) * H, mask_queries.data() + j * H,
+                                H * sizeof(float));
+                }
+                std::memcpy(pb.embd + 11 * H, mask_end_embed.data(), H * sizeof(float));
+
+                const int q0 = 2 * iter;      // mask_query slot 0, 2, 4, 6, 8
+                const int q1 = 2 * iter + 1;  // mask_query slot 1, 3, 5, 7, 9
+                for (int i = 0; i < n_inject; ++i) {
+                    pb.pos[i]       = ref_end_pos + 1 + i;
+                    pb.n_seq_id[i]  = 1;
+                    pb.seq_id[i][0] = 1;
+                    pb.logits[i]    = 0;
+                }
+                pb.logits[1 + q0] = 1;
+                pb.logits[1 + q1] = 1;
+                pb.n_tokens = n_inject;
+
+                if (llama_decode(lctx, pb) != 0)
+                    throw std::runtime_error("llama_decode (seg inject) failed at "
+                                              "iter " + std::to_string(iter) +
+                                              " phrase " + std::to_string(pi));
+
+                // With exactly 2 output-marks and n_seq_max=2 cap, output
+                // slots 0-1 correspond to the 2 marked positions in batch order.
+                for (int k = 0; k < 2; ++k) {
+                    const int slot = 2 * iter + k;
+                    const float * hs = llama_get_embeddings_ith(lctx, k);
+                    if (!hs) throw std::runtime_error("seg embed null at iter " +
+                                                       std::to_string(iter) +
+                                                       " k=" + std::to_string(k));
+                    std::memcpy(seg_out.data() + slot * H, hs, H * sizeof(float));
+                }
+                llama_batch_free(pb);
             }
             seg_outs.push_back(std::move(seg_out));
-            llama_batch_free(pb);
 
             std::cout << "  ✓ seg_output for \"" << phrases[pi] << "\" ("
                       << std::chrono::duration_cast<std::chrono::milliseconds>(
