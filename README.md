@@ -13,9 +13,12 @@ docker run --rm \
   -v $PWD/out:/out \
   ghcr.io/smellslikeml/instructsam:latest \
     --image /in/warehouse.jpg \
-    --query "Please segment 'box', 'person', 'forklift' in this image." \
+    --query ""Please list the main objects in this scene."" \
     --out-dir /out --run-vision
 ```
+
+<img width="1280" height="426" alt="overlay" src="https://github.com/user-attachments/assets/b817682b-8c6e-4f88-a9a3-ae7faff12f2b" />
+
 
 Weights are converted from `CircleRadon/InstructSAM-2B` at Docker build
 time — no republishing. See `docker/Dockerfile` for the recipe.
