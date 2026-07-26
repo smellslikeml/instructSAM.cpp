@@ -607,7 +607,14 @@ int main(int argc, char ** argv) {
         cp.n_ctx           = 4096;
         cp.n_batch         = 1024;
         cp.n_ubatch        = 1024;
-        cp.n_seq_max       = 2;                          // seq 0 for AR, seq 1 for per-phrase seg injection
+        cp.n_seq_max       = 2;                          // seq 0 for AR, seq 1 for per-phrase seg
+                                                         // injection. NOTE: llama's sched_reserve caps
+                                                         // worst-case n_outputs to n_seq_max at context
+                                                         // init, so our 12-slot seg-inject silently
+                                                         // returns NaN for slots 2..9. Bumping to
+                                                         // n_seq_max=12 fixes the NaN but multiplies
+                                                         // KV-copy cost per seq_cp. See task #368 +
+                                                         // tools/compare_drift.py for the drift analysis.
         cp.embeddings      = true;                       // enable hidden-state readout
         cp.pooling_type    = LLAMA_POOLING_TYPE_NONE;    // per-token, not pooled
         cp.no_perf         = true;
@@ -745,6 +752,30 @@ int main(int argc, char ** argv) {
         const auto mask_end_embed   = lm_fwd.embed_for_token(sp.mask_end);
 
         llama_memory_t mem = llama_get_memory(lctx);
+
+        // Warm-up decode to force llama's scheduler to reserve output-buffer
+        // capacity for our 12-slot embd batches. Without this, the scheduler
+        // sizes output storage from the AR-decode pattern (n_outputs=1 per
+        // step, worst-case=2 for our n_seq_max=2), and later 12-output
+        // batches get silently capped — only the first 2-3 output slots come
+        // back with valid embeddings; the rest are NaN. Sending a dummy
+        // 12-token all-marked batch here forces the wider reservation.
+        {
+            llama_batch wb = llama_batch_init(12, H, 1);
+            for (int i = 0; i < 12; ++i) {
+                std::memset(wb.embd + i * H, 0, H * sizeof(float));
+                wb.pos[i]       = 0;
+                wb.n_seq_id[i]  = 1;
+                wb.seq_id[i][0] = 1;
+                wb.logits[i]    = 1;
+            }
+            wb.n_tokens = 12;
+            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
+            (void)llama_decode(lctx, wb);   // ignore result; only priming the scheduler
+            llama_batch_free(wb);
+            llama_memory_seq_rm(mem, /*seq_id=*/1, /*p0=*/0, /*p1=*/-1);
+        }
+
         for (size_t pi = 0; pi < phrases.size(); ++pi) {
             auto tphr = std::chrono::steady_clock::now();
             const llama_pos ref_end_pos = phrase_ref_end_pos[pi];
@@ -768,7 +799,11 @@ int main(int argc, char ** argv) {
                 pb.pos[i]       = ref_end_pos + 1 + i;
                 pb.n_seq_id[i]  = 1;
                 pb.seq_id[i][0] = 1;
-                pb.logits[i]    = (i >= 1 && i <= 10) ? 1 : 0;   // mask_queries only
+                pb.logits[i]    = 1;   // mark all — llama forces this under
+                                       // `embeddings=true`, marking selectively
+                                       // triggers "overriding" warning + returns
+                                       // uninitialized NaN for silently-dropped
+                                       // slots. See NaN pattern in seg_out for pi=0.
             }
             pb.n_tokens = n_inject;
 
@@ -776,9 +811,13 @@ int main(int argc, char ** argv) {
                 throw std::runtime_error("llama_decode (seg inject) failed for phrase " +
                                           std::to_string(pi));
 
+            // llama_get_embeddings_ith(j) returns the j-th output slot. With
+            // all 12 positions marked, output slots are: 0=mask_start,
+            // 1..10=mask_queries[0..9], 11=mask_end. Read slots 1..10 for the
+            // mask-query hidden states we actually want.
             std::vector<float> seg_out(10 * H);
             for (int j = 0; j < 10; ++j) {
-                const float * hs = llama_get_embeddings_ith(lctx, j);
+                const float * hs = llama_get_embeddings_ith(lctx, 1 + j);
                 if (!hs) throw std::runtime_error("seg embed null slot " +
                                                    std::to_string(j) + " phrase " +
                                                    std::to_string(pi));
@@ -830,6 +869,22 @@ int main(int argc, char ** argv) {
     // can pick each phrase's best mask slot properly instead of falling back
     // to peak-mask-sigmoid.
     const auto dp_w = load_scoring_weights(grounding);
+
+    // Per-stage dump root for the drift-investigation harness. When set,
+    // every DETR-chain intermediate lands as a BIN1 tensor under
+    // <dump_root>/obj<pi>/<stage>.f32 so tools/compare_drift.py can
+    // pair-compare against the reference oracle at
+    // <ref_dir>/binaries_obj<pi>/.
+    const char * dump_root_env = std::getenv("SAM3_CLI_DUMP_INTERMEDIATES");
+    const std::string dump_root = dump_root_env ? dump_root_env : "";
+    if (!dump_root.empty()) {
+        std::filesystem::create_directories(dump_root);
+        write_bin_f32(dump_root + "/md_fpn_bb0.f32", bb0, {256, 288, 288});
+        write_bin_f32(dump_root + "/md_fpn_bb1.f32", bb1, {256, 144, 144});
+        write_bin_f32(dump_root + "/md_fpn_bb2.f32", bb2, {256, 72, 72});
+        std::cout << "  · SAM3_CLI_DUMP_INTERMEDIATES=" << dump_root
+                  << " (per-image bb0/bb1/bb2 dumped)\n";
+    }
 
     std::cout << "\n=== stage 4: DETR chain per object ===\n";
     std::vector<std::vector<float>> per_obj_masks;
@@ -911,6 +966,28 @@ int main(int argc, char ** argv) {
         int top = 0; float tv = cls_score[0];
         for (int s = 1; s < 10; ++s) if (cls_score[s] > tv) { tv = cls_score[s]; top = s; }
         std::cout << "slot " << top << " → " << tv << "]\n";
+
+        // Per-object drift-investigation dumps.
+        if (!dump_root.empty()) {
+            const std::string od = dump_root + "/obj" + std::to_string(pi);
+            std::filesystem::create_directories(od);
+            write_bin_f32(od + "/lmb_seg_output_embeddings.f32", seg_outs[pi], {10, 2048});
+            write_bin_f32(od + "/lmb_mask_hidden_fcs_out.f32", queries_out.data, {10, 256});
+            write_bin_f32(od + "/enc_text_features.f32", text_features, {kPhraseMax, 256});
+            write_bin_f32(od + "/enc_vision_features_flat.f32", vision_features, {5184, 256});
+            write_bin_f32(od + "/detr_encoder_last_hidden.f32", enc_out.last_hidden_state,
+                          {enc_out.vision_seq, enc_out.hidden_dim});
+            for (size_t l = 0; l < dec_out.hs.size(); ++l) {
+                write_bin_f32(od + "/expected_layer_" + std::to_string(l) + ".f32",
+                              dec_out.hs[l], {10, 256});
+            }
+            write_bin_f32(od + "/md_decoder_queries.f32", decoder_queries, {10, 256});
+            write_bin_f32(od + "/md_pca_encoder_in.f32", post_encoder,
+                          {enc_out.vision_seq, enc_out.hidden_dim});
+            write_bin_f32(od + "/md_pixel_embed.f32", pixel_embed, {256, 288, 288});
+            write_bin_f32(od + "/md_pred_masks.f32", out.pred_masks, {10, 288, 288});
+            write_bin_f32(od + "/pred_logits.f32", pred_logits, {10});
+        }
     }
 
     // ── Write raw f32 blob + per-object PNGs + overlay panel ────────────
